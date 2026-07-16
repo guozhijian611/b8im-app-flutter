@@ -5,7 +5,7 @@ import 'package:b8im_app_flutter/src/im/im_bootstrap_client.dart';
 import 'package:b8im_app_flutter/src/network/app_api_client.dart';
 import 'package:b8im_app_flutter/src/session/app_session.dart';
 import 'package:b8im_app_flutter/src/session/app_session_service.dart';
-import 'package:b8im_app_flutter/src/storage/im_sync_cursor_store.dart';
+import 'package:b8im_app_flutter/src/storage/im_sync_cursor_gateway.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';

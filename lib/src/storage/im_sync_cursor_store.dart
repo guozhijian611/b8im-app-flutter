@@ -1,9 +1,6 @@
 import 'package:shared_preferences/shared_preferences.dart';
 
-abstract interface class ImSyncCursorGateway {
-  Future<String> read(int organization, String userId);
-  Future<void> write(int organization, String userId, String cursor);
-}
+import 'im_sync_cursor_gateway.dart';
 
 final class ImSyncCursorStore implements ImSyncCursorGateway {
   ImSyncCursorStore({SharedPreferencesAsync? preferences})

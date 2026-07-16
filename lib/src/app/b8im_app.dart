@@ -4,6 +4,7 @@ import '../config/app_environment.dart';
 import '../discovery/tenant_config.dart';
 import '../discovery/tenant_discovery_client.dart';
 import '../im/im_bootstrap_client.dart';
+import '../im/web_socket_im_socket.dart';
 import '../modules/client_module_registry.dart';
 import '../network/app_api_client.dart';
 import '../security/routing_signature_verifier.dart';
@@ -11,6 +12,7 @@ import '../session/app_session.dart';
 import '../session/app_session_bootstrapper.dart';
 import '../session/app_session_service.dart';
 import '../storage/device_identity_store.dart';
+import '../storage/im_sync_cursor_store.dart';
 
 final class B8imApp extends StatefulWidget {
   const B8imApp({
@@ -73,7 +75,11 @@ final class _B8imAppState extends State<B8imApp> {
       _sessionBootstrapGateway = AppSessionBootstrapper(
         sessionService: sessionService,
         moduleRegistry: _moduleRegistry,
-        imClient: ImBootstrapClient(sessionService: sessionService),
+        imClient: ImBootstrapClient(
+          sessionService: sessionService,
+          cursorStore: ImSyncCursorStore(),
+          socketFactory: WebSocketImSocket.connect,
+        ),
       );
     }
   }

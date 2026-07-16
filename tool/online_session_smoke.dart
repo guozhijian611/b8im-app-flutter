@@ -4,12 +4,11 @@ import 'dart:math';
 
 import 'package:b8im_app_flutter/src/discovery/tenant_discovery_client.dart';
 import 'package:b8im_app_flutter/src/im/im_bootstrap_client.dart';
-import 'package:b8im_app_flutter/src/modules/client_module_registry.dart';
 import 'package:b8im_app_flutter/src/network/app_api_client.dart';
 import 'package:b8im_app_flutter/src/security/routing_signature_verifier.dart';
 import 'package:b8im_app_flutter/src/session/app_session.dart';
-import 'package:b8im_app_flutter/src/session/app_session_bootstrapper.dart';
 import 'package:b8im_app_flutter/src/session/app_session_service.dart';
+import 'package:b8im_app_flutter/src/storage/im_sync_cursor_gateway.dart';
 
 Future<void> main() async {
   final environment = Platform.environment;
@@ -63,18 +62,27 @@ Future<void> main() async {
       throw StateError('测试线路地址不符合预期: api=$apiUri im=$imUri');
     }
     final service = AppSessionService(api);
-    final result =
-        await AppSessionBootstrapper(
-          sessionService: service,
-          moduleRegistry: ClientModuleRegistry(const []),
-          imClient: ImBootstrapClient(sessionService: service),
-        ).connect(
-          tenant: tenant,
-          account: account,
-          password: password,
-          deviceId: deviceId,
-          runtime: AppClientRuntime(os: os),
-        );
+    final session = await service.login(
+      tenant: tenant,
+      account: account,
+      password: password,
+      deviceId: deviceId,
+      runtime: AppClientRuntime(os: os),
+    );
+    final clientConfig = await service.fetchClientConfig(
+      tenant: tenant,
+      session: session,
+    );
+    final projectedModuleCount = _validateClientConfig(
+      clientConfig,
+      tenant.organization,
+      tenant.deploymentId,
+    );
+    final im = await ImBootstrapClient(
+      sessionService: service,
+      cursorStore: _MemoryCursorStore(),
+      socketFactory: _CommandLineImSocket.connect,
+    ).bootstrap(tenant: tenant, session: session);
 
     stdout.writeln(
       jsonEncode({
@@ -85,18 +93,70 @@ Future<void> main() async {
         'im': imUri.toString(),
         'client_family': 'app',
         'os': os,
-        'user_id': result.session.user.userId,
-        'resolved_module_count': result.modules.length,
-        'im_client_id': result.im.clientId,
-        'previous_global_seq': result.im.previousGlobalSeq,
-        'next_global_seq': result.im.nextGlobalSeq,
-        'synced_message_count': result.im.syncedMessageCount,
+        'user_id': session.user.userId,
+        'projected_module_count': projectedModuleCount,
+        'im_client_id': im.clientId,
+        'previous_global_seq': im.previousGlobalSeq,
+        'next_global_seq': im.nextGlobalSeq,
+        'synced_message_count': im.syncedMessageCount,
         'auth_sync_completed': true,
       }),
     );
   } finally {
     api.close();
     discovery.close();
+  }
+}
+
+int _validateClientConfig(
+  Object? value,
+  int organization,
+  String deploymentId,
+) {
+  if (value is! Map) throw const FormatException('客户端配置不是对象');
+  final config = value.map((key, item) => MapEntry(key.toString(), item));
+  if (config['organization'].toString() != organization.toString() ||
+      config['deployment_id'] != deploymentId ||
+      config['version'] is! int ||
+      config['features'] is! Map ||
+      config['modules'] is! List ||
+      config['tabbar'] is! List) {
+    throw const FormatException('客户端配置与 App 登录上下文不一致');
+  }
+  return (config['modules'] as List).length;
+}
+
+final class _CommandLineImSocket implements ImSocket {
+  _CommandLineImSocket(this._socket);
+
+  static Future<_CommandLineImSocket> connect(Uri uri) async {
+    final socket = await WebSocket.connect(
+      uri.toString(),
+    ).timeout(const Duration(seconds: 12));
+    return _CommandLineImSocket(socket);
+  }
+
+  final WebSocket _socket;
+
+  @override
+  Stream<Object?> get stream => _socket;
+
+  @override
+  void send(Object? value) => _socket.add(value);
+
+  @override
+  Future<void> close() async => _socket.close();
+}
+
+final class _MemoryCursorStore implements ImSyncCursorGateway {
+  String _value = '0';
+
+  @override
+  Future<String> read(int organization, String userId) async => _value;
+
+  @override
+  Future<void> write(int organization, String userId, String cursor) async {
+    _value = cursor;
   }
 }
 

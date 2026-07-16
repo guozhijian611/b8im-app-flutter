@@ -1,45 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:web_socket_channel/io.dart';
-import 'package:web_socket_channel/web_socket_channel.dart';
-
 import '../discovery/tenant_config.dart';
 import '../observability/trace_context.dart';
 import '../session/app_session.dart';
 import '../session/app_session_service.dart';
-import '../storage/im_sync_cursor_store.dart';
+import '../storage/im_sync_cursor_gateway.dart';
 
 abstract interface class ImSocket {
   Stream<Object?> get stream;
   void send(Object? value);
   Future<void> close();
-}
-
-final class WebSocketImSocket implements ImSocket {
-  WebSocketImSocket._(this._channel);
-
-  static Future<WebSocketImSocket> connect(
-    Uri uri, {
-    Duration timeout = const Duration(seconds: 10),
-  }) async {
-    final channel = IOWebSocketChannel.connect(uri, connectTimeout: timeout);
-    await channel.ready.timeout(timeout);
-    return WebSocketImSocket._(channel);
-  }
-
-  final WebSocketChannel _channel;
-
-  @override
-  Stream<Object?> get stream => _channel.stream;
-
-  @override
-  void send(Object? value) => _channel.sink.add(value);
-
-  @override
-  Future<void> close() async {
-    await _channel.sink.close();
-  }
 }
 
 typedef ImSocketFactory = Future<ImSocket> Function(Uri uri);
@@ -67,17 +38,14 @@ final class ImBootstrapResult {
 final class ImBootstrapClient {
   ImBootstrapClient({
     required this.sessionService,
-    ImSyncCursorGateway? cursorStore,
-    ImSocketFactory? socketFactory,
+    required this.cursorStore,
+    required this.socketFactory,
     this.timeout = const Duration(seconds: 12),
-  }) : _cursorStore = cursorStore ?? ImSyncCursorStore(),
-       _socketFactory =
-           socketFactory ??
-           ((uri) => WebSocketImSocket.connect(uri, timeout: timeout));
+  });
 
   final AppSessionService sessionService;
-  final ImSyncCursorGateway _cursorStore;
-  final ImSocketFactory _socketFactory;
+  final ImSyncCursorGateway cursorStore;
+  final ImSocketFactory socketFactory;
   final Duration timeout;
 
   Future<ImBootstrapResult> bootstrap({
@@ -85,7 +53,7 @@ final class ImBootstrapClient {
     required AppSession session,
   }) async {
     final uri = tenant.routing.primary.endpoints.imServerUri;
-    final socket = await _socketFactory(uri).timeout(timeout);
+    final socket = await socketFactory(uri).timeout(timeout);
     final packets = StreamIterator<Object?>(socket.stream);
     try {
       final challenge = await _nextPacket(packets, {'auth'});
@@ -126,7 +94,7 @@ final class ImBootstrapClient {
       }
       final connectionSessionId = _requiredString(authData, 'session_id');
 
-      final cursor = await _cursorStore.read(
+      final cursor = await cursorStore.read(
         tenant.organization,
         session.user.userId,
       );
@@ -151,7 +119,7 @@ final class ImBootstrapClient {
       if (!RegExp(r'^(0|[1-9][0-9]*)$').hasMatch(nextCursor)) {
         throw const ImBootstrapException('SYNC_ACK global_seq 游标无效');
       }
-      await _cursorStore.write(
+      await cursorStore.write(
         tenant.organization,
         session.user.userId,
         nextCursor,
