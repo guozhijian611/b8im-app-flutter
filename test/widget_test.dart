@@ -88,6 +88,40 @@ final class _FakeImRuntime implements AppImRuntime {
   bool get isConnected => !closed;
 
   @override
+  AppImConnectionStatus get connectionStatus =>
+      closed ? AppImConnectionStatus.closed : AppImConnectionStatus.connected;
+
+  @override
+  Future<AppImReceipt> acknowledge({
+    required String messageId,
+    required AppImDeliveryStatus status,
+  }) async => AppImReceipt(
+    messageId: messageId,
+    conversationId: 'conversation-01',
+    messageSeq: 1,
+    senderId: 'peer-01',
+    userId: 'user-01',
+    status: status,
+    time: '2026-07-16 21:00:00',
+  );
+
+  @override
+  Future<AppImConversationReadState> markConversationRead({
+    required String conversationId,
+    required String lastReadMessageId,
+  }) async => AppImConversationReadState(
+    conversationId: conversationId,
+    lastReadMessageId: lastReadMessageId,
+    lastReadSeq: 1,
+    unreadCount: 0,
+    userId: 'user-01',
+    time: '2026-07-16 21:00:00',
+  );
+
+  @override
+  Future<void> reconnect() async {}
+
+  @override
   Future<AppImMessage> sendText({
     required int conversationType,
     required String text,
@@ -178,6 +212,7 @@ AppImMessage _message(
   editCount: 0,
   createTime: '2026-07-16 21:00:00',
   updateTime: '2026-07-16 21:00:00',
+  deliveryStatus: senderId == 'user-01' ? AppImDeliveryStatus.sent : null,
 );
 
 void main() {
@@ -246,5 +281,24 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('send-message')));
     await tester.pumpAndSettle();
     expect(find.text('Flutter 发出的消息'), findsOneWidget);
+    expect(find.text('已发送'), findsOneWidget);
+    im.controller.add(
+      const AppImEvent(
+        command: 'ack',
+        message: null,
+        eventId: null,
+        receipt: AppImReceipt(
+          messageId: 'message-02',
+          conversationId: 'conversation-01',
+          messageSeq: 2,
+          senderId: 'user-01',
+          userId: 'peer-01',
+          status: AppImDeliveryStatus.read,
+          time: '2026-07-16 21:00:01',
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('已读'), findsOneWidget);
   });
 }

@@ -31,13 +31,20 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
   List<AppImConversation> _conversations = const [];
   String? _error;
   bool _loading = true;
+  late AppImConnectionStatus _connectionStatus;
 
   @override
   void initState() {
     super.initState();
+    _connectionStatus = widget.im.connectionStatus;
     _eventSubscription = widget.im.events.listen(
       (event) {
-        if (event.command == 'push' || event.command == 'send_ack') {
+        if (event.connectionStatus case final status?) {
+          if (mounted) setState(() => _connectionStatus = status);
+        }
+        if (event.command == 'push' ||
+            event.command == 'send_ack' ||
+            event.command == 'sync') {
           unawaited(_load(showSpinner: false));
         }
       },
@@ -94,8 +101,90 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
     if (mounted) await _load(showSpinner: false);
   }
 
+  Future<void> _reconnect() async {
+    try {
+      await widget.im.reconnect();
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final content = switch ((_loading, _error, _conversations.isEmpty)) {
+      (true, _, _) => const Center(child: CircularProgressIndicator()),
+      (false, final String error, _) => _MessagingError(
+        message: error,
+        onRetry: _load,
+      ),
+      (false, null, true) => const Center(child: Text('暂无会话，收到或发送消息后会显示在这里')),
+      _ => RefreshIndicator(
+        onRefresh: _load,
+        child: ListView.separated(
+          key: const ValueKey('conversation-list'),
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          itemCount: _conversations.length,
+          separatorBuilder: (_, _) => const Divider(height: 1),
+          itemBuilder: (context, index) {
+            final conversation = _conversations[index];
+            return ListTile(
+              key: ValueKey('conversation-${conversation.conversationId}'),
+              onTap: () => _openConversation(conversation),
+              leading: CircleAvatar(
+                backgroundImage: conversation.avatarUrl.isEmpty
+                    ? null
+                    : NetworkImage(conversation.avatarUrl),
+                child: conversation.avatarUrl.isEmpty
+                    ? Text(_initial(conversation.title))
+                    : null,
+              ),
+              title: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      conversation.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  if (conversation.isMuted)
+                    const Padding(
+                      padding: EdgeInsets.only(left: 6),
+                      child: Icon(Icons.volume_off_outlined, size: 16),
+                    ),
+                ],
+              ),
+              subtitle: Text(
+                conversation.lastMessageSummary.isEmpty
+                    ? '暂无消息'
+                    : conversation.lastMessageSummary,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    _shortTime(conversation.lastMessageTime),
+                    style: Theme.of(context).textTheme.labelSmall,
+                  ),
+                  const SizedBox(height: 4),
+                  if (conversation.unreadCount > 0)
+                    Badge(
+                      label: Text(
+                        conversation.unreadCount > 99
+                            ? '99+'
+                            : '${conversation.unreadCount}',
+                      ),
+                    ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    };
     return Scaffold(
       appBar: AppBar(
         title: const Text('消息'),
@@ -108,80 +197,16 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
           ),
         ],
       ),
-      body: switch ((_loading, _error, _conversations.isEmpty)) {
-        (true, _, _) => const Center(child: CircularProgressIndicator()),
-        (false, final String error, _) => _MessagingError(
-          message: error,
-          onRetry: _load,
-        ),
-        (false, null, true) => const Center(child: Text('暂无会话，收到或发送消息后会显示在这里')),
-        _ => RefreshIndicator(
-          onRefresh: _load,
-          child: ListView.separated(
-            key: const ValueKey('conversation-list'),
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            itemCount: _conversations.length,
-            separatorBuilder: (_, _) => const Divider(height: 1),
-            itemBuilder: (context, index) {
-              final conversation = _conversations[index];
-              return ListTile(
-                key: ValueKey('conversation-${conversation.conversationId}'),
-                onTap: () => _openConversation(conversation),
-                leading: CircleAvatar(
-                  backgroundImage: conversation.avatarUrl.isEmpty
-                      ? null
-                      : NetworkImage(conversation.avatarUrl),
-                  child: conversation.avatarUrl.isEmpty
-                      ? Text(_initial(conversation.title))
-                      : null,
-                ),
-                title: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        conversation.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    if (conversation.isMuted)
-                      const Padding(
-                        padding: EdgeInsets.only(left: 6),
-                        child: Icon(Icons.volume_off_outlined, size: 16),
-                      ),
-                  ],
-                ),
-                subtitle: Text(
-                  conversation.lastMessageSummary.isEmpty
-                      ? '暂无消息'
-                      : conversation.lastMessageSummary,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                trailing: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    Text(
-                      _shortTime(conversation.lastMessageTime),
-                      style: Theme.of(context).textTheme.labelSmall,
-                    ),
-                    const SizedBox(height: 4),
-                    if (conversation.unreadCount > 0)
-                      Badge(
-                        label: Text(
-                          conversation.unreadCount > 99
-                              ? '99+'
-                              : '${conversation.unreadCount}',
-                        ),
-                      ),
-                  ],
-                ),
-              );
-            },
-          ),
-        ),
-      },
+      body: Column(
+        children: [
+          if (_connectionStatus != AppImConnectionStatus.connected)
+            _ConnectionBanner(
+              status: _connectionStatus,
+              onReconnect: _reconnect,
+            ),
+          Expanded(child: content),
+        ],
+      ),
     );
   }
 }
@@ -210,6 +235,8 @@ final class _ConversationPageState extends State<ConversationPage> {
   final TextEditingController _composer = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final Map<String, AppImMessage> _messages = {};
+  final Map<String, AppImDeliveryStatus> _deliveryStatuses = {};
+  final Set<String> _readAcknowledged = {};
   StreamSubscription<AppImEvent>? _eventSubscription;
   String? _error;
   int _beforeSeq = 0;
@@ -217,6 +244,7 @@ final class _ConversationPageState extends State<ConversationPage> {
   bool _loading = true;
   bool _loadingOlder = false;
   bool _sending = false;
+  late AppImConnectionStatus _connectionStatus;
 
   List<AppImMessage> get _orderedMessages {
     final values = _messages.values.toList();
@@ -227,8 +255,18 @@ final class _ConversationPageState extends State<ConversationPage> {
   @override
   void initState() {
     super.initState();
+    _connectionStatus = widget.im.connectionStatus;
     _eventSubscription = widget.im.events.listen(
       (event) {
+        if (event.connectionStatus case final status?) {
+          if (mounted) setState(() => _connectionStatus = status);
+        }
+        if (event.receipt case final receipt?) {
+          _applyReceipt(receipt);
+        }
+        if (event.conversationRead case final read?) {
+          _applyConversationRead(read);
+        }
         final message = event.message;
         if (message != null &&
             message.conversationId == widget.conversation.conversationId) {
@@ -305,13 +343,40 @@ final class _ConversationPageState extends State<ConversationPage> {
   Future<void> _markRead() async {
     if (_messages.isEmpty) return;
     try {
-      await widget.messaging.markRead(
-        tenant: widget.tenant,
-        session: widget.session,
-        conversationId: widget.conversation.conversationId,
-      );
+      final messages = _orderedMessages;
+      if (widget.im.isConnected) {
+        for (final message in messages) {
+          if (message.senderId == widget.session.user.userId ||
+              _readAcknowledged.contains(message.messageId)) {
+            continue;
+          }
+          await widget.im.acknowledge(
+            messageId: message.messageId,
+            status: AppImDeliveryStatus.read,
+          );
+          _readAcknowledged.add(message.messageId);
+        }
+        await widget.im.markConversationRead(
+          conversationId: widget.conversation.conversationId,
+          lastReadMessageId: messages.last.messageId,
+        );
+      } else {
+        await widget.messaging.markRead(
+          tenant: widget.tenant,
+          session: widget.session,
+          conversationId: widget.conversation.conversationId,
+        );
+      }
     } on Object catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      try {
+        await widget.messaging.markRead(
+          tenant: widget.tenant,
+          session: widget.session,
+          conversationId: widget.conversation.conversationId,
+        );
+      } on Object {
+        if (mounted) setState(() => _error = error.toString());
+      }
     }
   }
 
@@ -339,11 +404,52 @@ final class _ConversationPageState extends State<ConversationPage> {
     }
   }
 
+  Future<void> _reconnect() async {
+    try {
+      await widget.im.reconnect();
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    }
+  }
+
   void _merge(Iterable<AppImMessage> messages, {bool notify = true}) {
     for (final message in messages) {
       _messages[message.messageId] = message;
+      if (message.deliveryStatus case final status?) {
+        _advanceDelivery(message.messageId, status);
+      }
     }
     if (notify && mounted) setState(() {});
+  }
+
+  void _applyReceipt(AppImReceipt receipt) {
+    if (receipt.conversationId != widget.conversation.conversationId ||
+        receipt.senderId != widget.session.user.userId) {
+      return;
+    }
+    _advanceDelivery(receipt.messageId, receipt.status);
+    if (mounted) setState(() {});
+  }
+
+  void _applyConversationRead(AppImConversationReadState read) {
+    if (read.conversationId != widget.conversation.conversationId ||
+        read.userId == widget.session.user.userId) {
+      return;
+    }
+    for (final message in _messages.values) {
+      if (message.senderId == widget.session.user.userId &&
+          message.messageSeq <= read.lastReadSeq) {
+        _advanceDelivery(message.messageId, AppImDeliveryStatus.read);
+      }
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _advanceDelivery(String messageId, AppImDeliveryStatus next) {
+    final current = _deliveryStatuses[messageId];
+    if (current == null || next.rank > current.rank) {
+      _deliveryStatuses[messageId] = next;
+    }
   }
 
   void _scrollToBottom() {
@@ -365,6 +471,11 @@ final class _ConversationPageState extends State<ConversationPage> {
       body: SafeArea(
         child: Column(
           children: [
+            if (_connectionStatus != AppImConnectionStatus.connected)
+              _ConnectionBanner(
+                status: _connectionStatus,
+                onReconnect: _reconnect,
+              ),
             if (_error case final error?)
               MaterialBanner(
                 content: Text(error),
@@ -400,6 +511,7 @@ final class _ConversationPageState extends State<ConversationPage> {
                           message: message,
                           outgoing:
                               message.senderId == widget.session.user.userId,
+                          deliveryStatus: _deliveryStatuses[message.messageId],
                         );
                       },
                     ),
@@ -425,7 +537,11 @@ final class _ConversationPageState extends State<ConversationPage> {
                   const SizedBox(width: 8),
                   IconButton.filled(
                     key: const ValueKey('send-message'),
-                    onPressed: _sending ? null : _send,
+                    onPressed:
+                        _sending ||
+                            _connectionStatus != AppImConnectionStatus.connected
+                        ? null
+                        : _send,
                     icon: _sending
                         ? const SizedBox.square(
                             dimension: 18,
@@ -449,10 +565,12 @@ final class _MessageBubble extends StatelessWidget {
     super.key,
     required this.message,
     required this.outgoing,
+    required this.deliveryStatus,
   });
 
   final AppImMessage message;
   final bool outgoing;
+  final AppImDeliveryStatus? deliveryStatus;
 
   @override
   Widget build(BuildContext context) {
@@ -485,8 +603,46 @@ final class _MessageBubble extends StatelessWidget {
               _shortTime(message.createTime),
               style: Theme.of(context).textTheme.labelSmall,
             ),
+            if (outgoing && deliveryStatus != null)
+              Text(
+                deliveryStatus!.label,
+                key: ValueKey('delivery-${message.messageId}'),
+                style: Theme.of(context).textTheme.labelSmall,
+              ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+final class _ConnectionBanner extends StatelessWidget {
+  const _ConnectionBanner({required this.status, required this.onReconnect});
+
+  final AppImConnectionStatus status;
+  final Future<void> Function() onReconnect;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = switch (status) {
+      AppImConnectionStatus.connecting => '正在连接 IM…',
+      AppImConnectionStatus.reconnecting => '网络已断开，正在恢复离线消息…',
+      AppImConnectionStatus.closed => 'IM 连接已关闭',
+      AppImConnectionStatus.connected => '',
+    };
+    return Material(
+      color: Theme.of(context).colorScheme.errorContainer,
+      child: ListTile(
+        dense: true,
+        leading: const Icon(Icons.cloud_off_outlined),
+        title: Text(text),
+        trailing: status == AppImConnectionStatus.closed
+            ? null
+            : TextButton(
+                key: const ValueKey('reconnect-im'),
+                onPressed: onReconnect,
+                child: const Text('立即重连'),
+              ),
       ),
     );
   }

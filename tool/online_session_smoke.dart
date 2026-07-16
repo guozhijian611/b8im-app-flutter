@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:b8im_app_flutter/src/discovery/tenant_discovery_client.dart';
 import 'package:b8im_app_flutter/src/im/app_im_connection.dart';
 import 'package:b8im_app_flutter/src/im/im_socket.dart';
+import 'package:b8im_app_flutter/src/messaging/app_im_models.dart';
 import 'package:b8im_app_flutter/src/messaging/app_messaging_service.dart';
 import 'package:b8im_app_flutter/src/network/app_api_client.dart';
 import 'package:b8im_app_flutter/src/security/routing_signature_verifier.dart';
@@ -62,6 +63,9 @@ Future<void> main() async {
   final api = AppApiClient();
   AppImRuntime? connection;
   AppImRuntime? peerConnection;
+  StreamSubscription<AppImEvent>? senderEventSubscription;
+  final senderReceipts = <AppImReceipt>[];
+  final senderConversationReads = <AppImConversationReadState>[];
   try {
     final deviceId = _randomHex(32);
     final tenant = await discovery.discoverByEnterpriseCode(
@@ -90,13 +94,17 @@ Future<void> main() async {
       tenant.organization,
       tenant.deploymentId,
     );
-    connection = await AppImConnection.connect(
-      tenant: tenant,
-      session: session,
+    connection = await AppImConnector(
       sessionService: service,
       cursorStore: _MemoryCursorStore(),
       socketFactory: _CommandLineImSocket.connect,
-    );
+    ).connect(tenant: tenant, session: session);
+    final initialClientId = connection.bootstrap.clientId;
+    await connection.reconnect();
+    final reconnectedClientId = connection.bootstrap.clientId;
+    if (reconnectedClientId == initialClientId || !connection.isConnected) {
+      throw StateError('App 主动重连未建立新的 WSS 会话');
+    }
     final peerSession = await service.login(
       tenant: tenant,
       account: peerAccount,
@@ -110,13 +118,17 @@ Future<void> main() async {
         '${peerSession.user.userId}',
       );
     }
-    peerConnection = await AppImConnection.connect(
-      tenant: tenant,
-      session: peerSession,
+    peerConnection = await AppImConnector(
       sessionService: service,
       cursorStore: _MemoryCursorStore(),
       socketFactory: _CommandLineImSocket.connect,
-    );
+    ).connect(tenant: tenant, session: peerSession);
+    senderEventSubscription = connection.events.listen((event) {
+      if (event.receipt case final receipt?) senderReceipts.add(receipt);
+      if (event.conversationRead case final read?) {
+        senderConversationReads.add(read);
+      }
+    });
     final probeText = 'app-smoke-${DateTime.now().millisecondsSinceEpoch}';
     final pushFuture = peerConnection.events
         .firstWhere(
@@ -135,6 +147,30 @@ Future<void> main() async {
     if (pushed.message?.messageId != sent.messageId || pushed.eventId == null) {
       throw StateError('收件端 PUSH 与 SEND_ACK 消息不一致');
     }
+    final delivered = await _waitForReceipt(
+      senderReceipts,
+      sent.messageId,
+      AppImDeliveryStatus.delivered,
+    );
+    await peerConnection.acknowledge(
+      messageId: sent.messageId,
+      status: AppImDeliveryStatus.read,
+    );
+    await peerConnection.markConversationRead(
+      conversationId: sent.conversationId,
+      lastReadMessageId: sent.messageId,
+    );
+    final readReceipt = await _waitForReceipt(
+      senderReceipts,
+      sent.messageId,
+      AppImDeliveryStatus.read,
+    );
+    final conversationRead = await _waitForConversationRead(
+      senderConversationReads,
+      sent.conversationId,
+      peerUserId,
+      sent.messageSeq,
+    );
     final messaging = AppMessagingService(api);
     final conversations = await messaging.fetchConversations(
       tenant: tenant,
@@ -152,12 +188,14 @@ Future<void> main() async {
       conversationId: sent.conversationId,
       limit: 100,
     );
-    if (!page.messages.any(
-      (message) =>
-          message.messageId == sent.messageId &&
-          message.displayText == probeText,
-    )) {
+    final historyMessage = page.messages
+        .where((message) => message.messageId == sent.messageId)
+        .firstOrNull;
+    if (historyMessage == null || historyMessage.displayText != probeText) {
       throw StateError('SEND_ACK 消息未出现在 App HTTP 历史分页');
+    }
+    if (historyMessage.deliveryStatus != AppImDeliveryStatus.read) {
+      throw StateError('App HTTP 历史未恢复持久化 read 回执状态');
     }
     await messaging.markRead(
       tenant: tenant,
@@ -178,6 +216,9 @@ Future<void> main() async {
         'user_id': session.user.userId,
         'projected_module_count': projectedModuleCount,
         'im_client_id': im.clientId,
+        'initial_im_client_id': initialClientId,
+        'reconnected_im_client_id': reconnectedClientId,
+        'reconnect_completed': true,
         'previous_global_seq': im.previousGlobalSeq,
         'next_global_seq': im.nextGlobalSeq,
         'synced_message_count': im.syncedMessages.length,
@@ -191,16 +232,58 @@ Future<void> main() async {
         'peer_user_id': peerSession.user.userId,
         'peer_push_event_id': pushed.eventId,
         'peer_push_verified': true,
+        'delivered_receipt_status': delivered.status.name,
+        'read_receipt_status': readReceipt.status.name,
+        'conversation_read_seq': conversationRead.lastReadSeq,
+        'receipt_recovery_verified': true,
         'http_history_verified': true,
+        'http_delivery_status': historyMessage.deliveryStatus?.name,
         'mark_read_completed': true,
       }),
     );
   } finally {
+    await senderEventSubscription?.cancel();
     await peerConnection?.close();
     await connection?.close();
     api.close();
     discovery.close();
   }
+}
+
+Future<AppImReceipt> _waitForReceipt(
+  List<AppImReceipt> receipts,
+  String messageId,
+  AppImDeliveryStatus expected,
+) async {
+  for (var attempt = 0; attempt < 120; attempt++) {
+    for (final receipt in receipts.reversed) {
+      if (receipt.messageId == messageId &&
+          receipt.status.rank >= expected.rank) {
+        return receipt;
+      }
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+  }
+  throw TimeoutException('等待 ${expected.name} 回执超时');
+}
+
+Future<AppImConversationReadState> _waitForConversationRead(
+  List<AppImConversationReadState> states,
+  String conversationId,
+  String userId,
+  int minimumSeq,
+) async {
+  for (var attempt = 0; attempt < 120; attempt++) {
+    for (final state in states.reversed) {
+      if (state.conversationId == conversationId &&
+          state.userId == userId &&
+          state.lastReadSeq >= minimumSeq) {
+        return state;
+      }
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+  }
+  throw TimeoutException('等待 conversation_read 回执超时');
 }
 
 int _validateClientConfig(

@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:b8im_app_flutter/src/messaging/app_im_models.dart';
 import 'package:b8im_app_flutter/src/messaging/app_messaging_service.dart';
 import 'package:b8im_app_flutter/src/network/app_api_client.dart';
 import 'package:b8im_app_flutter/src/session/app_session.dart';
@@ -53,11 +54,12 @@ void main() {
                   'message_id': 'message-01',
                   'message_seq': 1,
                   'client_msg_id': 'client-01',
-                  'sender_id': 'peer-01',
+                  'sender_id': 'user-01',
                   'sender_user': null,
                   'message_type': 1,
                   'content': {'text': 'hello'},
                   'status': 1,
+                  'delivery_status': 'read',
                   'edit_time': '',
                   'edit_count': 0,
                   'create_time': '2026-07-16 21:00:00',
@@ -113,6 +115,7 @@ void main() {
     expect(conversations.single.peerUser?.userId, 'peer-01');
     expect(messages.messages.single.displayText, 'hello');
     expect(messages.messages.single.globalSeq, isNull);
+    expect(messages.messages.single.deliveryStatus, AppImDeliveryStatus.read);
     expect(updated, 1);
     expect(requests, hasLength(3));
     for (final request in requests) {

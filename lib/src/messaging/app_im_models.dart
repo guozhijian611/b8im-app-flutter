@@ -1,3 +1,115 @@
+enum AppImDeliveryStatus {
+  sent,
+  delivered,
+  read;
+
+  static AppImDeliveryStatus parse(String value, String field) {
+    return switch (value) {
+      'sent' => sent,
+      'delivered' => delivered,
+      'read' => read,
+      _ => throw FormatException('$field 格式无效'),
+    };
+  }
+
+  int get rank => switch (this) {
+    sent => 1,
+    delivered => 2,
+    read => 3,
+  };
+
+  String get label => switch (this) {
+    sent => '已发送',
+    delivered => '已送达',
+    read => '已读',
+  };
+}
+
+final class AppImReceipt {
+  const AppImReceipt({
+    required this.messageId,
+    required this.conversationId,
+    required this.messageSeq,
+    required this.senderId,
+    required this.userId,
+    required this.status,
+    required this.time,
+  });
+
+  factory AppImReceipt.fromJson(Object? value, String field) {
+    final map = imMap(value, field);
+    final sequence = imInt(map, 'message_seq', '$field.message_seq');
+    if (sequence <= 0) throw FormatException('$field.message_seq 格式无效');
+    return AppImReceipt(
+      messageId: imString(map, 'message_id', '$field.message_id'),
+      conversationId: imString(
+        map,
+        'conversation_id',
+        '$field.conversation_id',
+      ),
+      messageSeq: sequence,
+      senderId: imString(map, 'sender_id', '$field.sender_id'),
+      userId: imString(map, 'user_id', '$field.user_id'),
+      status: AppImDeliveryStatus.parse(
+        imString(map, 'status', '$field.status'),
+        '$field.status',
+      ),
+      time: imString(map, 'time', '$field.time'),
+    );
+  }
+
+  final String messageId;
+  final String conversationId;
+  final int messageSeq;
+  final String senderId;
+  final String userId;
+  final AppImDeliveryStatus status;
+  final String time;
+}
+
+final class AppImConversationReadState {
+  const AppImConversationReadState({
+    required this.conversationId,
+    required this.lastReadMessageId,
+    required this.lastReadSeq,
+    required this.unreadCount,
+    required this.userId,
+    required this.time,
+  });
+
+  factory AppImConversationReadState.fromJson(Object? value, String field) {
+    final map = imMap(value, field);
+    final sequence = imInt(map, 'last_read_seq', '$field.last_read_seq');
+    final unread = imInt(map, 'unread_count', '$field.unread_count');
+    if (sequence <= 0 || unread < 0) {
+      throw FormatException('$field 游标或未读数无效');
+    }
+    return AppImConversationReadState(
+      conversationId: imString(
+        map,
+        'conversation_id',
+        '$field.conversation_id',
+      ),
+      lastReadMessageId: imString(
+        map,
+        'last_read_message_id',
+        '$field.last_read_message_id',
+      ),
+      lastReadSeq: sequence,
+      unreadCount: unread,
+      userId: imString(map, 'user_id', '$field.user_id'),
+      time: imString(map, 'time', '$field.time'),
+    );
+  }
+
+  final String conversationId;
+  final String lastReadMessageId;
+  final int lastReadSeq;
+  final int unreadCount;
+  final String userId;
+  final String time;
+}
+
 final class AppImUserSummary {
   const AppImUserSummary({
     required this.userId,
@@ -126,6 +238,7 @@ final class AppImMessage {
     required this.editCount,
     required this.createTime,
     required this.updateTime,
+    required this.deliveryStatus,
   });
 
   factory AppImMessage.fromRealtime(Object? value) {
@@ -149,6 +262,7 @@ final class AppImMessage {
       globalSeq: globalSeq,
       status: status,
       content: content,
+      deliveryStatus: null,
     );
   }
 
@@ -161,12 +275,24 @@ final class AppImMessage {
       3 => 'deleted_both',
       _ => throw const FormatException('HTTP 消息 status 无效'),
     };
+    final deliveryStatusValue = imString(
+      map,
+      'delivery_status',
+      'message.delivery_status',
+      allowEmpty: true,
+    );
     return _fromMap(
       map,
       organization: organization,
       globalSeq: null,
       status: status,
       content: _content(map['content'], status, 'HTTP message'),
+      deliveryStatus: deliveryStatusValue.isEmpty
+          ? null
+          : AppImDeliveryStatus.parse(
+              deliveryStatusValue,
+              'message.delivery_status',
+            ),
     );
   }
 
@@ -176,6 +302,7 @@ final class AppImMessage {
     required String? globalSeq,
     required String status,
     required Map<String, Object?>? content,
+    required AppImDeliveryStatus? deliveryStatus,
   }) {
     final type = imInt(map, 'conversation_type', 'message.conversation_type');
     final sequence = imInt(map, 'message_seq', 'message.message_seq');
@@ -218,6 +345,7 @@ final class AppImMessage {
         allowEmpty: true,
         missingAsEmpty: true,
       ),
+      deliveryStatus: deliveryStatus,
     );
   }
 
@@ -237,6 +365,29 @@ final class AppImMessage {
   final int editCount;
   final String createTime;
   final String updateTime;
+  final AppImDeliveryStatus? deliveryStatus;
+
+  AppImMessage copyWith({AppImDeliveryStatus? deliveryStatus}) {
+    return AppImMessage(
+      organization: organization,
+      globalSeq: globalSeq,
+      conversationId: conversationId,
+      conversationType: conversationType,
+      messageId: messageId,
+      messageSeq: messageSeq,
+      clientMsgId: clientMsgId,
+      senderId: senderId,
+      senderUser: senderUser,
+      messageType: messageType,
+      content: content,
+      status: status,
+      editTime: editTime,
+      editCount: editCount,
+      createTime: createTime,
+      updateTime: updateTime,
+      deliveryStatus: deliveryStatus ?? this.deliveryStatus,
+    );
+  }
 
   String get displayText {
     if (status == 'recalled') return '消息已撤回';
