@@ -372,6 +372,10 @@ void main() {
     expect(find.text('通讯录'), findsOneWidget);
     expect(find.text('发现'), findsOneWidget);
     expect(find.text('我的'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('open-web-login-scanner')),
+      findsOneWidget,
+    );
     expect(find.text('测试好友'), findsOneWidget);
     expect(find.text('历史消息'), findsOneWidget);
     expect(find.byType(BackButton), findsNothing);

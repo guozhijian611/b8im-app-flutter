@@ -18,6 +18,7 @@ dependencies:
   http_parser: ^4.1.2
   image_picker: ^1.2.1
   mime: ^2.0.0
+  mobile_scanner: ^7.3.0
   path_provider: ^2.1.5
   # 2.3.x 改用 JNI，当前 Flutter 3.44.6 + Java 21/AGP 9 的 JdkImageTransform 无法构建。
   path_provider_android: 2.2.23

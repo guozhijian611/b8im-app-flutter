@@ -28,6 +28,8 @@
 	<true/>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>用于从相册选择图片并通过 b8im 发送。</string>
+	<key>NSCameraUsageDescription</key>
+	<string>用于扫描 Web 登录二维码并确认登录。</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

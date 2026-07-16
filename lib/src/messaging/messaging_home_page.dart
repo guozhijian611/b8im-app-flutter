@@ -7,6 +7,8 @@ import '../discovery/tenant_config.dart';
 import '../im/app_im_connection.dart';
 import '../media/app_media_picker.dart';
 import '../media/app_media_service.dart';
+import '../qr_login/app_qr_login_service.dart';
+import '../qr_login/web_login_scanner_page.dart';
 import '../session/app_session.dart';
 import 'app_im_models.dart';
 import 'app_messaging_service.dart';
@@ -20,6 +22,8 @@ final class MessagingHomePage extends StatefulWidget {
     required this.messaging,
     required this.media,
     required this.mediaPicker,
+    required this.qrLogin,
+    this.qrScannerFactory,
     this.beforeMediaUpload,
     this.onOpenContacts,
     this.onUnreadChanged,
@@ -31,6 +35,8 @@ final class MessagingHomePage extends StatefulWidget {
   final AppMessagingGateway messaging;
   final AppMediaGateway media;
   final AppMediaPickerGateway mediaPicker;
+  final AppQrLoginGateway qrLogin;
+  final AppQrCodeScannerFactory? qrScannerFactory;
   final Future<void> Function(int size)? beforeMediaUpload;
   final VoidCallback? onOpenContacts;
   final ValueChanged<int>? onUnreadChanged;
@@ -130,6 +136,24 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
     }
   }
 
+  Future<void> _openWebLoginScanner() async {
+    final confirmed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => WebLoginScannerPage(
+          tenant: widget.tenant,
+          session: widget.session,
+          gateway: widget.qrLogin,
+          scanner: widget.qrScannerFactory?.call(),
+        ),
+      ),
+    );
+    if (confirmed == true && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('已确认 Web 登录')));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final keyword = _searchController.text.trim().toLowerCase();
@@ -189,6 +213,12 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
             onPressed: widget.onOpenContacts,
             icon: const Icon(Icons.add_rounded),
             tooltip: '发起聊天',
+          ),
+          IconButton(
+            key: const ValueKey('open-web-login-scanner'),
+            onPressed: _openWebLoginScanner,
+            icon: const Icon(Icons.qr_code_scanner_rounded),
+            tooltip: '扫一扫',
           ),
         ],
       ),
