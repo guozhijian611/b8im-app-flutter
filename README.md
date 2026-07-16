@@ -4,7 +4,60 @@ b8im Flutter App 仓库，用于按企业码、租户信息和配置中心 JSON 
 
 ## 当前状态
 
-当前仓库只有设计入口，还没有 Flutter 工程、`pubspec.yaml`、`lib/` 或 `test/`。因此本阶段只固定 telemetry adapter 契约和未来验证门槛，不声称 Flutter Trace 已经运行、上报或验收通过。
+当前已建立 Flutter 3.44.6 / Dart 3.12.2 的 Android 与 iOS 工程，首个可运行基座包含：
+
+- 企业码与域名两种 `/saimulti/appInfo?client_family=app` 发现客户端。
+- 默认测试环境发现入口 `https://api.idev.love`。
+- schema v2 线路解析、HTTPS/WSS 强校验、有效期与 deployment 校验。
+- Ed25519 + 规范化 JSON 的线路签名验证；受信公钥必须由构建环境注入，不能从未验签响应动态信任。
+- 持久化随机设备 ID 和 W3C `traceparent` 的 HTTP/IM envelope 传播。
+- 固定模块白名单注册器；只有 App 已内置、后端 capability/permission 齐全且租户授权可用的模块才会渲染。
+- 单元、组件和线上发现 smoke 脚本。
+
+本阶段尚未实现登录、IM 会话、推送和具体商业模块页面；这些能力将在该基座上逐个以 Flutter package 接入，不能把注册器本身描述成模块已完成。
+
+## 本机开发
+
+```bash
+flutter pub get
+flutter analyze
+flutter test
+flutter build apk --debug
+flutter build ios --simulator --no-codesign
+```
+
+Android applicationId 与 iOS bundle identifier 均为 `love.idev.b8im`。正式 Android/iOS 商店签名不进入仓库，由发布环境注入。
+
+运行 App 时，线路签名公钥作为非秘密信任根由构建参数传入：
+
+```bash
+flutter run \
+  --dart-define=B8IM_DISCOVERY_BASE_URL=https://api.idev.love \
+  --dart-define=B8IM_ENTERPRISE_CODE=<测试企业码> \
+  --dart-define=B8IM_ROUTING_PUBLIC_KEYS='<kid 到 Ed25519 公钥的 JSON>'
+```
+
+线上发现 smoke 必须使用测试环境真实地址和真实发布快照：
+
+```bash
+B8IM_DISCOVERY_BASE_URL=https://api.idev.love \
+B8IM_ENTERPRISE_CODE=<测试企业码> \
+B8IM_ROUTING_PUBLIC_KEYS='<kid 到 Ed25519 公钥的 JSON>' \
+dart run tool/online_discovery_smoke.dart
+```
+
+脚本会验证签名，并强制断言 API 为 `api.idev.love`、IM 为 `ws.idev.love`；不接受 localhost 或 mock 作为线上联调结果。
+
+## App 模块接入
+
+模块 package 通过 path/private pub 依赖接入，并向 `ClientModuleRegistry` 提供 `ClientModuleRegistration`。注册对象必须声明：
+
+- `moduleKey`
+- App 端 capability
+- App 端 permission
+- 固定 Flutter builder
+
+服务端下发未知模块、缺 capability/permission、租户未授权或 App 未内置时均不渲染。前端隐藏不替代后端、IM 的授权校验。
 
 ## SDK 与 adapter 边界
 
