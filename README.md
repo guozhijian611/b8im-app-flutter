@@ -12,9 +12,11 @@ b8im Flutter App 仓库，用于按企业码、租户信息和配置中心 JSON 
 - Ed25519 + 规范化 JSON 的线路签名验证；受信公钥必须由构建环境注入，不能从未验签响应动态信任。
 - 持久化随机设备 ID 和 W3C `traceparent` 的 HTTP/IM envelope 传播。
 - 固定模块白名单注册器；只有 App 已内置、后端 capability/permission 齐全且租户授权可用的模块才会渲染。
-- 单元、组件和线上发现 smoke 脚本。
+- App 专用 `/saimulti/app/im/*` 登录与 `app-api` token 校验，不与 Web token 混用。
+- 登录后拉取 `client_family=app` 模块投影，并通过真实 WSS 完成 `AUTH_ACK` 与全局 `SYNC_ACK`。
+- 单元、组件、线上发现及线上 App 会话 smoke 脚本。
 
-本阶段尚未实现登录、IM 会话、推送和具体商业模块页面；这些能力将在该基座上逐个以 Flutter package 接入，不能把注册器本身描述成模块已完成。
+本阶段尚未实现消息列表、收发消息、推送和具体商业模块页面；这些能力将在当前会话与模块投影基座上逐个以 Flutter package 接入，不能把注册器本身描述成模块已完成。
 
 ## 本机开发
 
@@ -47,6 +49,20 @@ dart run tool/online_discovery_smoke.dart
 ```
 
 脚本会验证签名，并强制断言 API 为 `api.idev.love`、IM 为 `ws.idev.love`；不接受 localhost 或 mock 作为线上联调结果。
+
+线上 App 会话 smoke 会继续使用同一份 Flutter 登录、模块投影和 IM 启动代码，密码只从进程环境读取，输出不会包含 token 或密码：
+
+```bash
+B8IM_DISCOVERY_BASE_URL=https://api.idev.love \
+B8IM_ENTERPRISE_CODE=<测试企业码> \
+B8IM_ROUTING_PUBLIC_KEYS='<kid 到 Ed25519 公钥的 JSON>' \
+B8IM_APP_ACCOUNT=<测试账号> \
+B8IM_APP_PASSWORD=<测试密码> \
+B8IM_APP_OS=ios \
+dart run tool/online_session_smoke.dart
+```
+
+该脚本强制使用 `api.idev.love` 与 `ws.idev.love`，并且必须同时完成 App access token 校验、客户端配置投影、`AUTH_ACK` 和 `SYNC_ACK` 才会成功退出。
 
 ## App 模块接入
 

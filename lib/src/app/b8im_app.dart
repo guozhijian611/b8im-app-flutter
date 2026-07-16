@@ -3,8 +3,13 @@ import 'package:flutter/material.dart';
 import '../config/app_environment.dart';
 import '../discovery/tenant_config.dart';
 import '../discovery/tenant_discovery_client.dart';
+import '../im/im_bootstrap_client.dart';
 import '../modules/client_module_registry.dart';
+import '../network/app_api_client.dart';
 import '../security/routing_signature_verifier.dart';
+import '../session/app_session.dart';
+import '../session/app_session_bootstrapper.dart';
+import '../session/app_session_service.dart';
 import '../storage/device_identity_store.dart';
 
 final class B8imApp extends StatefulWidget {
@@ -14,12 +19,16 @@ final class B8imApp extends StatefulWidget {
     this.discoveryGateway,
     this.deviceIdLoader,
     this.moduleRegistry,
+    this.sessionBootstrapGateway,
+    this.runtime,
   });
 
   final AppEnvironment? environment;
   final TenantDiscoveryGateway? discoveryGateway;
   final Future<String> Function()? deviceIdLoader;
   final ClientModuleRegistry? moduleRegistry;
+  final AppSessionBootstrapGateway? sessionBootstrapGateway;
+  final AppClientRuntime? runtime;
 
   @override
   State<B8imApp> createState() => _B8imAppState();
@@ -30,22 +39,50 @@ final class _B8imAppState extends State<B8imApp> {
   late final TenantDiscoveryGateway _discoveryGateway;
   late final Future<String> Function() _deviceIdLoader;
   late final ClientModuleRegistry _moduleRegistry;
+  late final AppSessionBootstrapGateway _sessionBootstrapGateway;
+  late final AppClientRuntime _runtime;
+  TenantDiscoveryClient? _ownedDiscoveryClient;
+  AppApiClient? _ownedApiClient;
 
   @override
   void initState() {
     super.initState();
     _environment = widget.environment ?? AppEnvironment.fromCompileTime();
-    _discoveryGateway =
-        widget.discoveryGateway ??
-        TenantDiscoveryClient(
-          discoveryBaseUri: _environment.discoveryBaseUri,
-          signatureVerifier: RoutingSignatureVerifier(
-            _environment.routingPublicKeys,
-          ),
-        );
+    if (widget.discoveryGateway case final gateway?) {
+      _discoveryGateway = gateway;
+    } else {
+      final client = TenantDiscoveryClient(
+        discoveryBaseUri: _environment.discoveryBaseUri,
+        signatureVerifier: RoutingSignatureVerifier(
+          _environment.routingPublicKeys,
+        ),
+      );
+      _ownedDiscoveryClient = client;
+      _discoveryGateway = client;
+    }
     _deviceIdLoader =
         widget.deviceIdLoader ?? DeviceIdentityStore().loadOrCreate;
     _moduleRegistry = widget.moduleRegistry ?? ClientModuleRegistry(const []);
+    _runtime = widget.runtime ?? AppClientRuntime.current();
+    if (widget.sessionBootstrapGateway case final gateway?) {
+      _sessionBootstrapGateway = gateway;
+    } else {
+      final apiClient = AppApiClient();
+      final sessionService = AppSessionService(apiClient);
+      _ownedApiClient = apiClient;
+      _sessionBootstrapGateway = AppSessionBootstrapper(
+        sessionService: sessionService,
+        moduleRegistry: _moduleRegistry,
+        imClient: ImBootstrapClient(sessionService: sessionService),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _ownedDiscoveryClient?.close();
+    _ownedApiClient?.close();
+    super.dispose();
   }
 
   @override
@@ -71,6 +108,8 @@ final class _B8imAppState extends State<B8imApp> {
         discoveryGateway: _discoveryGateway,
         deviceIdLoader: _deviceIdLoader,
         moduleRegistry: _moduleRegistry,
+        sessionBootstrapGateway: _sessionBootstrapGateway,
+        runtime: _runtime,
       ),
     );
   }
@@ -83,12 +122,16 @@ final class BootstrapPage extends StatefulWidget {
     required this.discoveryGateway,
     required this.deviceIdLoader,
     required this.moduleRegistry,
+    required this.sessionBootstrapGateway,
+    required this.runtime,
   });
 
   final AppEnvironment environment;
   final TenantDiscoveryGateway discoveryGateway;
   final Future<String> Function() deviceIdLoader;
   final ClientModuleRegistry moduleRegistry;
+  final AppSessionBootstrapGateway sessionBootstrapGateway;
+  final AppClientRuntime runtime;
 
   @override
   State<BootstrapPage> createState() => _BootstrapPageState();
@@ -96,10 +139,15 @@ final class BootstrapPage extends StatefulWidget {
 
 final class _BootstrapPageState extends State<BootstrapPage> {
   late final TextEditingController _enterpriseCodeController;
+  late final TextEditingController _accountController;
+  late final TextEditingController _passwordController;
   String? _deviceId;
   TenantConfig? _tenant;
+  AppSessionBootstrapResult? _sessionResult;
   String? _error;
+  String? _sessionError;
   bool _loading = false;
+  bool _sessionLoading = false;
 
   @override
   void initState() {
@@ -107,6 +155,8 @@ final class _BootstrapPageState extends State<BootstrapPage> {
     _enterpriseCodeController = TextEditingController(
       text: widget.environment.initialEnterpriseCode,
     );
+    _accountController = TextEditingController();
+    _passwordController = TextEditingController();
     widget.deviceIdLoader().then((value) {
       if (mounted) setState(() => _deviceId = value);
     });
@@ -115,6 +165,8 @@ final class _BootstrapPageState extends State<BootstrapPage> {
   @override
   void dispose() {
     _enterpriseCodeController.dispose();
+    _accountController.dispose();
+    _passwordController.dispose();
     super.dispose();
   }
 
@@ -124,6 +176,8 @@ final class _BootstrapPageState extends State<BootstrapPage> {
       _loading = true;
       _error = null;
       _tenant = null;
+      _sessionResult = null;
+      _sessionError = null;
     });
     try {
       final tenant = await widget.discoveryGateway.discoverByEnterpriseCode(
@@ -135,6 +189,43 @@ final class _BootstrapPageState extends State<BootstrapPage> {
       if (mounted) setState(() => _error = error.toString());
     } finally {
       if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _connectSession() async {
+    final tenant = _tenant;
+    final deviceId = _deviceId;
+    if (tenant == null || deviceId == null || deviceId.isEmpty) {
+      setState(() => _sessionError = '设备标识尚未就绪，请稍后重试');
+      return;
+    }
+    final account = _accountController.text.trim();
+    final password = _passwordController.text;
+    if (account.isEmpty || password.isEmpty) {
+      setState(() => _sessionError = '请输入账号和密码');
+      return;
+    }
+
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _sessionLoading = true;
+      _sessionError = null;
+      _sessionResult = null;
+    });
+    try {
+      final result = await widget.sessionBootstrapGateway.connect(
+        tenant: tenant,
+        account: account,
+        password: password,
+        deviceId: deviceId,
+        runtime: widget.runtime,
+      );
+      _passwordController.clear();
+      if (mounted) setState(() => _sessionResult = result);
+    } on Object catch (error) {
+      if (mounted) setState(() => _sessionError = error.toString());
+    } finally {
+      if (mounted) setState(() => _sessionLoading = false);
     }
   }
 
@@ -204,7 +295,150 @@ final class _BootstrapPageState extends State<BootstrapPage> {
             if (_tenant case final tenant?) ...[
               const SizedBox(height: 16),
               _TenantCard(tenant: tenant),
+              const SizedBox(height: 16),
+              _LoginCard(
+                accountController: _accountController,
+                passwordController: _passwordController,
+                loading: _sessionLoading,
+                os: widget.runtime.os,
+                onLogin: _connectSession,
+              ),
             ],
+            if (_sessionError case final error?) ...[
+              const SizedBox(height: 16),
+              _MessageCard(
+                color: Theme.of(context).colorScheme.errorContainer,
+                icon: Icons.error_outline,
+                title: '登录或 IM 初始化失败',
+                message: error,
+              ),
+            ],
+            if (_sessionResult case final result?) ...[
+              const SizedBox(height: 16),
+              _SessionCard(result: result),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+final class _LoginCard extends StatelessWidget {
+  const _LoginCard({
+    required this.accountController,
+    required this.passwordController,
+    required this.loading,
+    required this.os,
+    required this.onLogin,
+  });
+
+  final TextEditingController accountController;
+  final TextEditingController passwordController;
+  final bool loading;
+  final String os;
+  final Future<void> Function() onLogin;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              '登录并连接 IM',
+              style: Theme.of(
+                context,
+              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 6),
+            Text('当前平台：$os · 密码仅用于本次登录，不会持久化'),
+            const SizedBox(height: 16),
+            TextField(
+              key: const ValueKey('login-account'),
+              controller: accountController,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: const InputDecoration(
+                labelText: '账号',
+                prefixIcon: Icon(Icons.person_outline),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              key: const ValueKey('login-password'),
+              controller: passwordController,
+              obscureText: true,
+              enableSuggestions: false,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                labelText: '密码',
+                prefixIcon: Icon(Icons.lock_outline),
+              ),
+              onSubmitted: (_) => loading ? null : onLogin(),
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              key: const ValueKey('login-button'),
+              onPressed: loading ? null : onLogin,
+              icon: loading
+                  ? const SizedBox.square(
+                      dimension: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.login_rounded),
+              label: Text(loading ? '正在建立安全会话…' : '登录并同步'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+final class _SessionCard extends StatelessWidget {
+  const _SessionCard({required this.result});
+
+  final AppSessionBootstrapResult result;
+
+  @override
+  Widget build(BuildContext context) {
+    final user = result.session.user;
+    final im = result.im;
+    return Card(
+      color: Theme.of(context).colorScheme.primaryContainer,
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.sync_lock_rounded),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'AUTH + SYNC 已完成',
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            _InfoRow(label: '用户', value: '${user.nickname} (${user.account})'),
+            _InfoRow(label: '授权模块', value: '${result.modules.length}'),
+            _InfoRow(label: 'IM Client', value: im.clientId),
+            _InfoRow(
+              label: '全局游标',
+              value: '${im.previousGlobalSeq} → ${im.nextGlobalSeq}',
+            ),
+            _InfoRow(label: '同步消息', value: '${im.syncedMessageCount}'),
           ],
         ),
       ),
