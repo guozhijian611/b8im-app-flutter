@@ -1,7 +1,7 @@
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-import 'im_bootstrap_client.dart';
+import 'im_socket.dart';
 
 final class WebSocketImSocket implements ImSocket {
   WebSocketImSocket._(this._channel);

@@ -3,7 +3,9 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:b8im_app_flutter/src/discovery/tenant_discovery_client.dart';
-import 'package:b8im_app_flutter/src/im/im_bootstrap_client.dart';
+import 'package:b8im_app_flutter/src/im/app_im_connection.dart';
+import 'package:b8im_app_flutter/src/im/im_socket.dart';
+import 'package:b8im_app_flutter/src/messaging/app_messaging_service.dart';
 import 'package:b8im_app_flutter/src/network/app_api_client.dart';
 import 'package:b8im_app_flutter/src/security/routing_signature_verifier.dart';
 import 'package:b8im_app_flutter/src/session/app_session.dart';
@@ -16,16 +18,18 @@ Future<void> main() async {
   final keyJson = environment['B8IM_ROUTING_PUBLIC_KEYS']?.trim() ?? '';
   final account = environment['B8IM_APP_ACCOUNT']?.trim() ?? '';
   final password = environment['B8IM_APP_PASSWORD'] ?? '';
+  final peerUserId = environment['B8IM_APP_PEER_USER_ID']?.trim() ?? '';
   final os = environment['B8IM_APP_OS']?.trim() ?? 'ios';
   final discoveryBaseUrl =
       environment['B8IM_DISCOVERY_BASE_URL']?.trim() ?? 'https://api.idev.love';
   if (enterpriseCode.isEmpty ||
       keyJson.isEmpty ||
       account.isEmpty ||
-      password.isEmpty) {
+      password.isEmpty ||
+      peerUserId.isEmpty) {
     stderr.writeln(
       '需要 B8IM_ENTERPRISE_CODE、B8IM_ROUTING_PUBLIC_KEYS、'
-      'B8IM_APP_ACCOUNT 和 B8IM_APP_PASSWORD 环境变量',
+      'B8IM_APP_ACCOUNT、B8IM_APP_PASSWORD 和 B8IM_APP_PEER_USER_ID 环境变量',
     );
     exitCode = 64;
     return;
@@ -50,6 +54,7 @@ Future<void> main() async {
     signatureVerifier: RoutingSignatureVerifier(keys),
   );
   final api = AppApiClient();
+  AppImRuntime? connection;
   try {
     final deviceId = _randomHex(32);
     final tenant = await discovery.discoverByEnterpriseCode(
@@ -78,11 +83,49 @@ Future<void> main() async {
       tenant.organization,
       tenant.deploymentId,
     );
-    final im = await ImBootstrapClient(
+    connection = await AppImConnection.connect(
+      tenant: tenant,
+      session: session,
       sessionService: service,
       cursorStore: _MemoryCursorStore(),
       socketFactory: _CommandLineImSocket.connect,
-    ).bootstrap(tenant: tenant, session: session);
+    );
+    final probeText = 'app-smoke-${DateTime.now().millisecondsSinceEpoch}';
+    final sent = await connection.sendText(
+      conversationType: 1,
+      toUserId: peerUserId,
+      text: probeText,
+    );
+    final messaging = AppMessagingService(api);
+    final conversations = await messaging.fetchConversations(
+      tenant: tenant,
+      session: session,
+    );
+    final conversation = conversations
+        .where((item) => item.conversationId == sent.conversationId)
+        .firstOrNull;
+    if (conversation == null || conversation.peerUser?.userId != peerUserId) {
+      throw StateError('SEND_ACK 会话未出现在 App 会话列表');
+    }
+    final page = await messaging.fetchMessages(
+      tenant: tenant,
+      session: session,
+      conversationId: sent.conversationId,
+      limit: 100,
+    );
+    if (!page.messages.any(
+      (message) =>
+          message.messageId == sent.messageId &&
+          message.displayText == probeText,
+    )) {
+      throw StateError('SEND_ACK 消息未出现在 App HTTP 历史分页');
+    }
+    await messaging.markRead(
+      tenant: tenant,
+      session: session,
+      conversationId: sent.conversationId,
+    );
+    final im = connection.bootstrap;
 
     stdout.writeln(
       jsonEncode({
@@ -98,11 +141,20 @@ Future<void> main() async {
         'im_client_id': im.clientId,
         'previous_global_seq': im.previousGlobalSeq,
         'next_global_seq': im.nextGlobalSeq,
-        'synced_message_count': im.syncedMessageCount,
+        'synced_message_count': im.syncedMessages.length,
         'auth_sync_completed': true,
+        'conversation_count': conversations.length,
+        'sent_message_id': sent.messageId,
+        'sent_conversation_id': sent.conversationId,
+        'sent_message_seq': sent.messageSeq,
+        'sent_global_seq': sent.globalSeq,
+        'send_ack_completed': true,
+        'http_history_verified': true,
+        'mark_read_completed': true,
       }),
     );
   } finally {
+    await connection?.close();
     api.close();
     discovery.close();
   }

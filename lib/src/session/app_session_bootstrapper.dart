@@ -1,5 +1,5 @@
 import '../discovery/tenant_config.dart';
-import '../im/im_bootstrap_client.dart';
+import '../im/app_im_connection.dart';
 import '../modules/client_module_registry.dart';
 import 'app_session.dart';
 import 'app_session_service.dart';
@@ -13,7 +13,7 @@ final class AppSessionBootstrapResult {
 
   final AppSession session;
   final List<ResolvedClientModule> modules;
-  final ImBootstrapResult im;
+  final AppImRuntime im;
 }
 
 abstract interface class AppSessionBootstrapGateway {
@@ -30,12 +30,12 @@ final class AppSessionBootstrapper implements AppSessionBootstrapGateway {
   AppSessionBootstrapper({
     required this.sessionService,
     required this.moduleRegistry,
-    required this.imClient,
+    required this.imConnector,
   });
 
   final AppSessionService sessionService;
   final ClientModuleRegistry moduleRegistry;
-  final ImBootstrapClient imClient;
+  final AppImConnectorGateway imConnector;
 
   @override
   Future<AppSessionBootstrapResult> connect({
@@ -60,7 +60,7 @@ final class AppSessionBootstrapper implements AppSessionBootstrapGateway {
       payload: clientConfig,
       tenant: tenant,
     );
-    final im = await imClient.bootstrap(tenant: tenant, session: session);
+    final im = await imConnector.connect(tenant: tenant, session: session);
 
     return AppSessionBootstrapResult(
       session: session,

@@ -1,11 +1,15 @@
+import 'dart:async';
+
 import 'package:b8im_app_flutter/src/app/b8im_app.dart';
 import 'package:b8im_app_flutter/src/config/app_environment.dart';
 import 'package:b8im_app_flutter/src/discovery/tenant_config.dart';
 import 'package:b8im_app_flutter/src/discovery/tenant_discovery_client.dart';
-import 'package:b8im_app_flutter/src/im/im_bootstrap_client.dart';
+import 'package:b8im_app_flutter/src/im/app_im_connection.dart';
+import 'package:b8im_app_flutter/src/messaging/app_im_models.dart';
+import 'package:b8im_app_flutter/src/messaging/app_messaging_service.dart';
 import 'package:b8im_app_flutter/src/session/app_session.dart';
 import 'package:b8im_app_flutter/src/session/app_session_bootstrapper.dart';
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'support/tenant_fixture.dart';
@@ -26,6 +30,10 @@ final class _FakeDiscovery implements TenantDiscoveryGateway {
 }
 
 final class _FakeSessionBootstrap implements AppSessionBootstrapGateway {
+  _FakeSessionBootstrap(this.im);
+
+  final AppImRuntime im;
+
   @override
   Future<AppSessionBootstrapResult> connect({
     required TenantConfig tenant,
@@ -54,21 +62,127 @@ final class _FakeSessionBootstrap implements AppSessionBootstrapGateway {
         ),
       ),
       modules: const [],
-      im: const ImBootstrapResult(
-        clientId: 'client-01',
-        connectionSessionId: 'connection-01',
-        credentialSessionId: 'credential-01',
-        previousGlobalSeq: '0',
-        nextGlobalSeq: '7',
-        syncedMessageCount: 2,
-        hasMore: false,
-      ),
+      im: im,
     );
   }
 }
 
+final class _FakeImRuntime implements AppImRuntime {
+  final StreamController<AppImEvent> controller = StreamController.broadcast();
+  bool closed = false;
+
+  @override
+  AppImBootstrapSnapshot get bootstrap => const AppImBootstrapSnapshot(
+    clientId: 'client-01',
+    connectionSessionId: 'connection-01',
+    credentialSessionId: 'credential-01',
+    previousGlobalSeq: '0',
+    nextGlobalSeq: '7',
+    syncedMessages: [],
+  );
+
+  @override
+  Stream<AppImEvent> get events => controller.stream;
+
+  @override
+  bool get isConnected => !closed;
+
+  @override
+  Future<AppImMessage> sendText({
+    required int conversationType,
+    required String text,
+    String? conversationId,
+    String? toUserId,
+  }) async {
+    expect(conversationType, 1);
+    expect(conversationId, 'conversation-01');
+    expect(toUserId, 'peer-01');
+    return _message('message-02', 2, text, 'user-01');
+  }
+
+  @override
+  Future<void> close() async {
+    closed = true;
+    await controller.close();
+  }
+}
+
+final class _FakeMessaging implements AppMessagingGateway {
+  @override
+  Future<List<AppImConversation>> fetchConversations({
+    required TenantConfig tenant,
+    required AppSession session,
+  }) async => const [
+    AppImConversation(
+      conversationId: 'conversation-01',
+      conversationType: 1,
+      title: '测试好友',
+      peerUser: AppImUserSummary(
+        userId: 'peer-01',
+        account: 'peer',
+        nickname: '测试好友',
+        avatarUrl: '',
+      ),
+      lastMessageId: 'message-01',
+      lastMessageSeq: 1,
+      lastMessageSummary: '历史消息',
+      lastMessageTime: '2026-07-16 21:00:00',
+      unreadCount: 1,
+      isPinned: false,
+      isMuted: false,
+      avatarUrl: '',
+    ),
+  ];
+
+  @override
+  Future<AppImMessagePage> fetchMessages({
+    required TenantConfig tenant,
+    required AppSession session,
+    required String conversationId,
+    int beforeSeq = 0,
+    int limit = 50,
+  }) async => AppImMessagePage(
+    messages: [_message('message-01', 1, '历史消息', 'peer-01')],
+    nextAfterSeq: 1,
+    nextBeforeSeq: 1,
+    hasMoreBefore: false,
+  );
+
+  @override
+  Future<int> markRead({
+    required TenantConfig tenant,
+    required AppSession session,
+    required String conversationId,
+  }) async => 1;
+}
+
+AppImMessage _message(
+  String messageId,
+  int sequence,
+  String text,
+  String senderId,
+) => AppImMessage(
+  organization: 1,
+  globalSeq: '$sequence',
+  conversationId: 'conversation-01',
+  conversationType: 1,
+  messageId: messageId,
+  messageSeq: sequence,
+  clientMsgId: 'client-$messageId',
+  senderId: senderId,
+  senderUser: null,
+  messageType: 1,
+  content: {'text': text},
+  status: 'normal',
+  editTime: '',
+  editCount: 0,
+  createTime: '2026-07-16 21:00:00',
+  updateTime: '2026-07-16 21:00:00',
+);
+
 void main() {
   testWidgets('使用企业码展示已验签的测试环境线路', (tester) async {
+    final im = _FakeImRuntime();
     await tester.pumpWidget(
       B8imApp(
         environment: AppEnvironment(
@@ -78,7 +192,8 @@ void main() {
         ),
         discoveryGateway: _FakeDiscovery(),
         deviceIdLoader: () async => '0123456789abcdef0123456789abcdef',
-        sessionBootstrapGateway: _FakeSessionBootstrap(),
+        sessionBootstrapGateway: _FakeSessionBootstrap(im),
+        messagingGateway: _FakeMessaging(),
         runtime: const AppClientRuntime(os: 'ios'),
       ),
     );
@@ -110,5 +225,26 @@ void main() {
     expect(find.text('AUTH + SYNC 已完成'), findsOneWidget);
     expect(find.text('验收用户 (acceptance)'), findsOneWidget);
     expect(find.text('0 → 7'), findsOneWidget);
+
+    await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.byKey(const ValueKey('open-messaging')));
+    await tester.tap(find.byKey(const ValueKey('open-messaging')));
+    await tester.pumpAndSettle();
+    expect(find.text('测试好友'), findsOneWidget);
+    expect(find.text('历史消息'), findsOneWidget);
+
+    await tester.tap(
+      find.byKey(const ValueKey('conversation-conversation-01')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('message-message-01')), findsOneWidget);
+    await tester.enterText(
+      find.byKey(const ValueKey('message-composer')),
+      'Flutter 发出的消息',
+    );
+    await tester.tap(find.byKey(const ValueKey('send-message')));
+    await tester.pumpAndSettle();
+    expect(find.text('Flutter 发出的消息'), findsOneWidget);
   });
 }

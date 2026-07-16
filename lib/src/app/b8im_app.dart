@@ -1,10 +1,14 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../config/app_environment.dart';
 import '../discovery/tenant_config.dart';
 import '../discovery/tenant_discovery_client.dart';
-import '../im/im_bootstrap_client.dart';
+import '../im/app_im_connection.dart';
 import '../im/web_socket_im_socket.dart';
+import '../messaging/app_messaging_service.dart';
+import '../messaging/messaging_home_page.dart';
 import '../modules/client_module_registry.dart';
 import '../network/app_api_client.dart';
 import '../security/routing_signature_verifier.dart';
@@ -22,6 +26,7 @@ final class B8imApp extends StatefulWidget {
     this.deviceIdLoader,
     this.moduleRegistry,
     this.sessionBootstrapGateway,
+    this.messagingGateway,
     this.runtime,
   });
 
@@ -30,6 +35,7 @@ final class B8imApp extends StatefulWidget {
   final Future<String> Function()? deviceIdLoader;
   final ClientModuleRegistry? moduleRegistry;
   final AppSessionBootstrapGateway? sessionBootstrapGateway;
+  final AppMessagingGateway? messagingGateway;
   final AppClientRuntime? runtime;
 
   @override
@@ -42,6 +48,7 @@ final class _B8imAppState extends State<B8imApp> {
   late final Future<String> Function() _deviceIdLoader;
   late final ClientModuleRegistry _moduleRegistry;
   late final AppSessionBootstrapGateway _sessionBootstrapGateway;
+  late final AppMessagingGateway _messagingGateway;
   late final AppClientRuntime _runtime;
   TenantDiscoveryClient? _ownedDiscoveryClient;
   AppApiClient? _ownedApiClient;
@@ -66,22 +73,28 @@ final class _B8imAppState extends State<B8imApp> {
         widget.deviceIdLoader ?? DeviceIdentityStore().loadOrCreate;
     _moduleRegistry = widget.moduleRegistry ?? ClientModuleRegistry(const []);
     _runtime = widget.runtime ?? AppClientRuntime.current();
+    AppApiClient? apiClient;
+    if (widget.sessionBootstrapGateway == null ||
+        widget.messagingGateway == null) {
+      apiClient = AppApiClient();
+      _ownedApiClient = apiClient;
+    }
     if (widget.sessionBootstrapGateway case final gateway?) {
       _sessionBootstrapGateway = gateway;
     } else {
-      final apiClient = AppApiClient();
-      final sessionService = AppSessionService(apiClient);
-      _ownedApiClient = apiClient;
+      final sessionService = AppSessionService(apiClient!);
       _sessionBootstrapGateway = AppSessionBootstrapper(
         sessionService: sessionService,
         moduleRegistry: _moduleRegistry,
-        imClient: ImBootstrapClient(
+        imConnector: AppImConnector(
           sessionService: sessionService,
           cursorStore: ImSyncCursorStore(),
           socketFactory: WebSocketImSocket.connect,
         ),
       );
     }
+    _messagingGateway =
+        widget.messagingGateway ?? AppMessagingService(apiClient!);
   }
 
   @override
@@ -115,6 +128,7 @@ final class _B8imAppState extends State<B8imApp> {
         deviceIdLoader: _deviceIdLoader,
         moduleRegistry: _moduleRegistry,
         sessionBootstrapGateway: _sessionBootstrapGateway,
+        messagingGateway: _messagingGateway,
         runtime: _runtime,
       ),
     );
@@ -129,6 +143,7 @@ final class BootstrapPage extends StatefulWidget {
     required this.deviceIdLoader,
     required this.moduleRegistry,
     required this.sessionBootstrapGateway,
+    required this.messagingGateway,
     required this.runtime,
   });
 
@@ -137,6 +152,7 @@ final class BootstrapPage extends StatefulWidget {
   final Future<String> Function() deviceIdLoader;
   final ClientModuleRegistry moduleRegistry;
   final AppSessionBootstrapGateway sessionBootstrapGateway;
+  final AppMessagingGateway messagingGateway;
   final AppClientRuntime runtime;
 
   @override
@@ -170,6 +186,7 @@ final class _BootstrapPageState extends State<BootstrapPage> {
 
   @override
   void dispose() {
+    unawaited(_sessionResult?.im.close());
     _enterpriseCodeController.dispose();
     _accountController.dispose();
     _passwordController.dispose();
@@ -178,6 +195,7 @@ final class _BootstrapPageState extends State<BootstrapPage> {
 
   Future<void> _discover() async {
     FocusScope.of(context).unfocus();
+    final previous = _sessionResult;
     setState(() {
       _loading = true;
       _error = null;
@@ -185,6 +203,7 @@ final class _BootstrapPageState extends State<BootstrapPage> {
       _sessionResult = null;
       _sessionError = null;
     });
+    if (previous != null) await previous.im.close();
     try {
       final tenant = await widget.discoveryGateway.discoverByEnterpriseCode(
         _enterpriseCodeController.text,
@@ -213,11 +232,13 @@ final class _BootstrapPageState extends State<BootstrapPage> {
     }
 
     FocusScope.of(context).unfocus();
+    final previous = _sessionResult;
     setState(() {
       _sessionLoading = true;
       _sessionError = null;
       _sessionResult = null;
     });
+    if (previous != null) await previous.im.close();
     try {
       final result = await widget.sessionBootstrapGateway.connect(
         tenant: tenant,
@@ -233,6 +254,22 @@ final class _BootstrapPageState extends State<BootstrapPage> {
     } finally {
       if (mounted) setState(() => _sessionLoading = false);
     }
+  }
+
+  Future<void> _openMessaging() async {
+    final tenant = _tenant;
+    final result = _sessionResult;
+    if (tenant == null || result == null) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => MessagingHomePage(
+          tenant: tenant,
+          session: result.session,
+          im: result.im,
+          messaging: widget.messagingGateway,
+        ),
+      ),
+    );
   }
 
   @override
@@ -321,7 +358,7 @@ final class _BootstrapPageState extends State<BootstrapPage> {
             ],
             if (_sessionResult case final result?) ...[
               const SizedBox(height: 16),
-              _SessionCard(result: result),
+              _SessionCard(result: result, onOpenMessaging: _openMessaging),
             ],
           ],
         ),
@@ -406,14 +443,15 @@ final class _LoginCard extends StatelessWidget {
 }
 
 final class _SessionCard extends StatelessWidget {
-  const _SessionCard({required this.result});
+  const _SessionCard({required this.result, required this.onOpenMessaging});
 
   final AppSessionBootstrapResult result;
+  final Future<void> Function() onOpenMessaging;
 
   @override
   Widget build(BuildContext context) {
     final user = result.session.user;
-    final im = result.im;
+    final im = result.im.bootstrap;
     return Card(
       color: Theme.of(context).colorScheme.primaryContainer,
       margin: EdgeInsets.zero,
@@ -444,7 +482,17 @@ final class _SessionCard extends StatelessWidget {
               label: '全局游标',
               value: '${im.previousGlobalSeq} → ${im.nextGlobalSeq}',
             ),
-            _InfoRow(label: '同步消息', value: '${im.syncedMessageCount}'),
+            _InfoRow(label: '同步消息', value: '${im.syncedMessages.length}'),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                key: const ValueKey('open-messaging'),
+                onPressed: onOpenMessaging,
+                icon: const Icon(Icons.forum_outlined),
+                label: const Text('进入消息'),
+              ),
+            ),
           ],
         ),
       ),

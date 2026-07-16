@@ -14,9 +14,11 @@ b8im Flutter App 仓库，用于按企业码、租户信息和配置中心 JSON 
 - 固定模块白名单注册器；只有 App 已内置、后端 capability/permission 齐全且租户授权可用的模块才会渲染。
 - App 专用 `/saimulti/app/im/*` 登录与 `app-api` token 校验，不与 Web token 混用。
 - 登录后拉取 `client_family=app` 模块投影，并通过真实 WSS 完成 `AUTH_ACK` 与全局 `SYNC_ACK`。
+- 持久 WSS 会话、心跳、分页 SYNC、实时 PUSH 事件去重和文本 `SEND/SEND_ACK`。
+- App 专用会话列表、历史消息分页、会话已读接口，以及 Flutter 消息列表与聊天页面。
 - 单元、组件、线上发现及线上 App 会话 smoke 脚本。
 
-本阶段尚未实现消息列表、收发消息、推送和具体商业模块页面；这些能力将在当前会话与模块投影基座上逐个以 Flutter package 接入，不能把注册器本身描述成模块已完成。
+本阶段尚未实现系统通知推送、图片/文件/语音等富媒体消息和具体商业模块页面；这些能力将在当前消息运行时与模块投影基座上逐个以 Flutter package 接入，不能把注册器本身描述成模块已完成。
 
 ## 本机开发
 
@@ -58,11 +60,12 @@ B8IM_ENTERPRISE_CODE=<测试企业码> \
 B8IM_ROUTING_PUBLIC_KEYS='<kid 到 Ed25519 公钥的 JSON>' \
 B8IM_APP_ACCOUNT=<测试账号> \
 B8IM_APP_PASSWORD=<测试密码> \
+B8IM_APP_PEER_USER_ID=<同机构好友 user_id> \
 B8IM_APP_OS=ios \
 dart run tool/online_session_smoke.dart
 ```
 
-该脚本强制使用 `api.idev.love` 与 `ws.idev.love`，并且必须同时完成 App access token 校验、客户端配置投影、`AUTH_ACK` 和 `SYNC_ACK` 才会成功退出。
+该脚本强制使用 `api.idev.love` 与 `ws.idev.love`，并且必须同时完成 App access token 校验、客户端配置投影、`AUTH_ACK`、`SYNC_ACK`、文本 `SEND_ACK`、HTTP 会话/历史回读和已读写入才会成功退出。脚本会向指定测试好友写入一条带时间戳的 QA 文本消息。
 
 ## App 模块接入
 
