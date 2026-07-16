@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -19,6 +20,8 @@ Future<void> main() async {
   final account = environment['B8IM_APP_ACCOUNT']?.trim() ?? '';
   final password = environment['B8IM_APP_PASSWORD'] ?? '';
   final peerUserId = environment['B8IM_APP_PEER_USER_ID']?.trim() ?? '';
+  final peerAccount = environment['B8IM_APP_PEER_ACCOUNT']?.trim() ?? '';
+  final peerPassword = environment['B8IM_APP_PEER_PASSWORD'] ?? '';
   final os = environment['B8IM_APP_OS']?.trim() ?? 'ios';
   final discoveryBaseUrl =
       environment['B8IM_DISCOVERY_BASE_URL']?.trim() ?? 'https://api.idev.love';
@@ -26,10 +29,13 @@ Future<void> main() async {
       keyJson.isEmpty ||
       account.isEmpty ||
       password.isEmpty ||
-      peerUserId.isEmpty) {
+      peerUserId.isEmpty ||
+      peerAccount.isEmpty ||
+      peerPassword.isEmpty) {
     stderr.writeln(
       '需要 B8IM_ENTERPRISE_CODE、B8IM_ROUTING_PUBLIC_KEYS、'
-      'B8IM_APP_ACCOUNT、B8IM_APP_PASSWORD 和 B8IM_APP_PEER_USER_ID 环境变量',
+      'B8IM_APP_ACCOUNT、B8IM_APP_PASSWORD、B8IM_APP_PEER_USER_ID、'
+      'B8IM_APP_PEER_ACCOUNT 和 B8IM_APP_PEER_PASSWORD 环境变量',
     );
     exitCode = 64;
     return;
@@ -55,6 +61,7 @@ Future<void> main() async {
   );
   final api = AppApiClient();
   AppImRuntime? connection;
+  AppImRuntime? peerConnection;
   try {
     final deviceId = _randomHex(32);
     final tenant = await discovery.discoverByEnterpriseCode(
@@ -90,12 +97,44 @@ Future<void> main() async {
       cursorStore: _MemoryCursorStore(),
       socketFactory: _CommandLineImSocket.connect,
     );
+    final peerSession = await service.login(
+      tenant: tenant,
+      account: peerAccount,
+      password: peerPassword,
+      deviceId: _randomHex(32),
+      runtime: AppClientRuntime(os: os),
+    );
+    if (peerSession.user.userId != peerUserId) {
+      throw StateError(
+        '收件账号 user_id 与 B8IM_APP_PEER_USER_ID 不一致: '
+        '${peerSession.user.userId}',
+      );
+    }
+    peerConnection = await AppImConnection.connect(
+      tenant: tenant,
+      session: peerSession,
+      sessionService: service,
+      cursorStore: _MemoryCursorStore(),
+      socketFactory: _CommandLineImSocket.connect,
+    );
     final probeText = 'app-smoke-${DateTime.now().millisecondsSinceEpoch}';
+    final pushFuture = peerConnection.events
+        .firstWhere(
+          (event) =>
+              event.command == 'push' &&
+              event.message?.senderId == session.user.userId &&
+              event.message?.displayText == probeText,
+        )
+        .timeout(const Duration(seconds: 12));
     final sent = await connection.sendText(
       conversationType: 1,
       toUserId: peerUserId,
       text: probeText,
     );
+    final pushed = await pushFuture;
+    if (pushed.message?.messageId != sent.messageId || pushed.eventId == null) {
+      throw StateError('收件端 PUSH 与 SEND_ACK 消息不一致');
+    }
     final messaging = AppMessagingService(api);
     final conversations = await messaging.fetchConversations(
       tenant: tenant,
@@ -149,11 +188,15 @@ Future<void> main() async {
         'sent_message_seq': sent.messageSeq,
         'sent_global_seq': sent.globalSeq,
         'send_ack_completed': true,
+        'peer_user_id': peerSession.user.userId,
+        'peer_push_event_id': pushed.eventId,
+        'peer_push_verified': true,
         'http_history_verified': true,
         'mark_read_completed': true,
       }),
     );
   } finally {
+    await peerConnection?.close();
     await connection?.close();
     api.close();
     discovery.close();
@@ -179,22 +222,66 @@ int _validateClientConfig(
 }
 
 final class _CommandLineImSocket implements ImSocket {
-  _CommandLineImSocket(this._socket);
+  _CommandLineImSocket(this._socket, {required this._debug});
 
   static Future<_CommandLineImSocket> connect(Uri uri) async {
     final socket = await WebSocket.connect(
       uri.toString(),
     ).timeout(const Duration(seconds: 12));
-    return _CommandLineImSocket(socket);
+    return _CommandLineImSocket(
+      socket,
+      debug: Platform.environment['B8IM_IM_DEBUG'] == '1',
+    );
   }
 
   final WebSocket _socket;
+  final bool _debug;
 
   @override
-  Stream<Object?> get stream => _socket;
+  Stream<Object?> get stream => _socket.transform(
+    StreamTransformer.fromHandlers(
+      handleData: (data, sink) {
+        if (_debug) stderr.writeln('IM <= $data');
+        sink.add(data);
+      },
+      handleError: (error, stackTrace, sink) {
+        if (_debug) stderr.writeln('IM !! $error');
+        sink.addError(error, stackTrace);
+      },
+      handleDone: (sink) {
+        if (_debug) {
+          stderr.writeln(
+            'IM <= CLOSE code=${_socket.closeCode} reason=${_socket.closeReason}',
+          );
+        }
+        sink.close();
+      },
+    ),
+  );
 
   @override
-  void send(Object? value) => _socket.add(value);
+  void send(Object? value) {
+    if (_debug) stderr.writeln('IM => ${_redactOutbound(value)}');
+    _socket.add(value);
+  }
+
+  Object? _redactOutbound(Object? value) {
+    if (value is! String) return value;
+    try {
+      final decoded = jsonDecode(value);
+      if (decoded is Map && decoded['cmd'] == 'auth') {
+        final copy = Map<String, Object?>.from(decoded);
+        final rawData = copy['data'];
+        if (rawData is Map) {
+          copy['data'] = {...rawData, 'token': '<redacted>'};
+        }
+        return jsonEncode(copy);
+      }
+    } on FormatException {
+      // 原始值仍交由协议层处理；调试输出只做尽力脱敏。
+    }
+    return value;
+  }
 
   @override
   Future<void> close() async => _socket.close();

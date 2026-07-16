@@ -111,7 +111,8 @@ final class _MessagingSocket implements ImSocket {
     _controller.add(
       jsonEncode({
         'cmd': 'auth',
-        'organization': 1,
+        // WebSocket 握手阶段尚未建立租户身份，线上 challenge 固定为 0。
+        'organization': 0,
         'data': {'client_id': 'client-01'},
       }),
     );

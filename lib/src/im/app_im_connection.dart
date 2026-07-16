@@ -356,8 +356,14 @@ final class AppImConnection implements AppImRuntime {
       if (command is! String || command.trim().isEmpty) {
         throw const FormatException('IM packet.cmd 无效');
       }
+      final packetOrganization = packet['organization'];
+      final isUnscopedPreAuthPacket =
+          !_authenticated &&
+          packetOrganization == 0 &&
+          (command == 'auth' || command == 'error');
       if (packet.containsKey('organization') &&
-          packet['organization'] != tenant.organization) {
+          packetOrganization != tenant.organization &&
+          !isUnscopedPreAuthPacket) {
         throw const FormatException('IM packet.organization 不一致');
       }
       for (final waiter in List<_PacketWaiter>.from(_waiters)) {

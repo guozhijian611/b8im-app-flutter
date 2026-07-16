@@ -61,11 +61,13 @@ B8IM_ROUTING_PUBLIC_KEYS='<kid 到 Ed25519 公钥的 JSON>' \
 B8IM_APP_ACCOUNT=<测试账号> \
 B8IM_APP_PASSWORD=<测试密码> \
 B8IM_APP_PEER_USER_ID=<同机构好友 user_id> \
+B8IM_APP_PEER_ACCOUNT=<同机构好友测试账号> \
+B8IM_APP_PEER_PASSWORD=<同机构好友测试密码> \
 B8IM_APP_OS=ios \
 dart run tool/online_session_smoke.dart
 ```
 
-该脚本强制使用 `api.idev.love` 与 `ws.idev.love`，并且必须同时完成 App access token 校验、客户端配置投影、`AUTH_ACK`、`SYNC_ACK`、文本 `SEND_ACK`、HTTP 会话/历史回读和已读写入才会成功退出。脚本会向指定测试好友写入一条带时间戳的 QA 文本消息。
+该脚本强制使用 `api.idev.love` 与 `ws.idev.love`，并且必须同时完成发送端和收件端 App access token 校验、客户端配置投影、`AUTH_ACK`、`SYNC_ACK`、文本 `SEND_ACK`、收件端实时 `PUSH`、HTTP 会话/历史回读和已读写入才会成功退出。脚本会向指定测试好友写入一条带时间戳的 QA 文本消息。
 
 ## App 模块接入
 
