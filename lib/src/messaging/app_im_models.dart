@@ -1,3 +1,5 @@
+import 'package:b8im_app_flutter/src/messaging/contact_display_label.dart';
+
 enum AppImDeliveryStatus {
   sent,
   delivered,
@@ -116,20 +118,53 @@ final class AppImUserSummary {
     required this.account,
     required this.nickname,
     required this.avatarUrl,
+    this.organization = 0,
+    this.companyName = '',
+    this.isCrossOrganization = false,
+    this.displayNameOverride = '',
   });
 
   factory AppImUserSummary.fromJson(Object? value, String field) {
     final map = imMap(value, field);
+    final nickname = imString(map, 'nickname', '$field.nickname', allowEmpty: true);
+    final account = imString(map, 'account', '$field.account', allowEmpty: true);
+    final companyName = imString(
+      map,
+      'company_name',
+      '$field.company_name',
+      allowEmpty: true,
+    );
+    final organizationName = imString(
+      map,
+      'organization_name',
+      '$field.organization_name',
+      allowEmpty: true,
+    );
+    final resolvedCompany =
+        companyName.isNotEmpty ? companyName : organizationName;
+    final isCross = map['is_cross_organization'] == true ||
+        map['is_cross_organization'] == 1 ||
+        map['is_cross_organization'] == '1';
+    final serverDisplay = imString(
+      map,
+      'display_name',
+      '$field.display_name',
+      allowEmpty: true,
+    );
     return AppImUserSummary(
       userId: imString(map, 'user_id', '$field.user_id'),
-      account: imString(map, 'account', '$field.account', allowEmpty: true),
-      nickname: imString(map, 'nickname', '$field.nickname', allowEmpty: true),
+      account: account,
+      nickname: nickname,
       avatarUrl: imString(
         map,
         'avatar_url',
         '$field.avatar_url',
         allowEmpty: true,
       ),
+      organization: _imOptionalInt(map, 'organization'),
+      companyName: resolvedCompany,
+      isCrossOrganization: isCross,
+      displayNameOverride: serverDisplay,
     );
   }
 
@@ -137,8 +172,18 @@ final class AppImUserSummary {
   final String account;
   final String nickname;
   final String avatarUrl;
+  final int organization;
+  final String companyName;
+  final bool isCrossOrganization;
+  final String displayNameOverride;
 
-  String get displayName => nickname.isNotEmpty ? nickname : account;
+  String get displayName => ContactDisplayLabel.format(
+        nickname: nickname,
+        account: account,
+        companyName: companyName,
+        isCrossOrganization: isCrossOrganization,
+        serverDisplayName: displayNameOverride,
+      );
 }
 
 final class AppImConversation {
@@ -526,4 +571,18 @@ void _validateMessageContent(
       extension.trim().isEmpty) {
     throw const FormatException('附件消息内容无效');
   }
+}
+
+int _imOptionalInt(Map<String, Object?> map, String key) {
+  final value = map[key];
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value) ?? 0;
+  }
+  return 0;
 }
