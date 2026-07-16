@@ -9,7 +9,7 @@ b8im Flutter App 仓库，用于按企业码、租户信息和配置中心 JSON 
 - 企业码与域名两种 `/saimulti/appInfo?client_family=app` 发现客户端。
 - 默认测试环境发现入口 `https://api.idev.love`。
 - schema v2 线路解析、HTTPS/WSS 强校验、有效期与 deployment 校验。
-- Ed25519 + 规范化 JSON 的线路签名验证；受信公钥必须由构建环境注入，不能从未验签响应动态信任。
+- Ed25519 + 规范化 JSON 的线路签名验证；官方测试环境信任根随 App 内置，私有化和密钥轮换构建可由构建环境覆盖，任何场景都不能从未验签响应动态信任。
 - 持久化随机设备 ID 和 W3C `traceparent` 的 HTTP/IM envelope 传播。
 - 固定模块白名单注册器；只有 App 已内置、后端 capability/permission 齐全且租户授权可用的模块才会渲染。
 - App 专用 `/saimulti/app/im/*` 登录与 `app-api` token 校验，不与 Web token 混用。
@@ -35,7 +35,7 @@ flutter build ios --simulator --no-codesign
 
 Android applicationId 与 iOS bundle identifier 均为 `love.idev.b8im`。正式 Android/iOS 商店签名不进入仓库，由发布环境注入。
 
-运行 App 时，线路签名公钥作为非秘密信任根由构建参数传入：
+直接运行 App 会使用 `https://api.idev.love` 及其内置的公开线路签名信任根，不再因漏传构建参数而启动失败。私有化部署或密钥轮换时，通过构建参数完整覆盖发现入口和信任根：
 
 ```bash
 flutter run \

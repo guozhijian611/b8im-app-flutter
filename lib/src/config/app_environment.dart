@@ -1,5 +1,12 @@
 import 'dart:convert';
 
+const _defaultDiscoveryBaseUrl = 'https://api.idev.love';
+
+// 公钥不是秘密。默认信任根必须与默认发现服务一起内置，确保官方构建开箱可用；
+// 私有化或密钥轮换构建仍可通过 B8IM_ROUTING_PUBLIC_KEYS 完整覆盖。
+const _defaultRoutingPublicKeys =
+    '{"routing-test-20260713":"zmCoq_5gBvehkWdyhSloXZJVHU_nbpZ16ySHJvNKUo8"}';
+
 final class AppEnvironment {
   const AppEnvironment({
     required this.discoveryBaseUri,
@@ -10,11 +17,11 @@ final class AppEnvironment {
   factory AppEnvironment.fromCompileTime() {
     const discoveryBaseUrl = String.fromEnvironment(
       'B8IM_DISCOVERY_BASE_URL',
-      defaultValue: 'https://api.idev.love',
+      defaultValue: _defaultDiscoveryBaseUrl,
     );
     const routingPublicKeysJson = String.fromEnvironment(
       'B8IM_ROUTING_PUBLIC_KEYS',
-      defaultValue: '{}',
+      defaultValue: _defaultRoutingPublicKeys,
     );
     const initialEnterpriseCode = String.fromEnvironment(
       'B8IM_ENTERPRISE_CODE',

@@ -29,6 +29,21 @@ final class _FakeDiscovery implements TenantDiscoveryGateway {
   }
 }
 
+final class _BrokenDiscovery implements TenantDiscoveryGateway {
+  @override
+  Future<TenantConfig> discoverByDomain(String domain, {String? deviceId}) {
+    return Future.error(StateError('未配置 App 线路签名受信公钥'));
+  }
+
+  @override
+  Future<TenantConfig> discoverByEnterpriseCode(
+    String enterpriseCode, {
+    String? deviceId,
+  }) {
+    return Future.error(StateError('未配置 App 线路签名受信公钥'));
+  }
+}
+
 final class _FakeSessionBootstrap implements AppSessionBootstrapGateway {
   _FakeSessionBootstrap(this.im);
 
@@ -225,7 +240,31 @@ AppImMessage _message(
 );
 
 void main() {
-  testWidgets('使用企业码展示已验签的测试环境线路', (tester) async {
+  testWidgets('连接异常不会向用户暴露内部错误', (tester) async {
+    await tester.pumpWidget(
+      B8imApp(
+        environment: AppEnvironment(
+          discoveryBaseUri: Uri.parse('https://api.idev.love'),
+          routingPublicKeys: const {},
+          initialEnterpriseCode: 'org_1',
+        ),
+        discoveryGateway: _BrokenDiscovery(),
+        deviceIdLoader: () async => '0123456789abcdef0123456789abcdef',
+        sessionBootstrapGateway: _FakeSessionBootstrap(_FakeImRuntime()),
+        messagingGateway: _FakeMessaging(),
+        runtime: const AppClientRuntime(os: 'ios'),
+      ),
+    );
+
+    await tester.tap(find.byKey(const ValueKey('discover-button')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('客户端安全配置异常，请更新 App 后重试'), findsOneWidget);
+    expect(find.textContaining('Bad state'), findsNothing);
+    expect(find.textContaining('受信公钥'), findsNothing);
+  });
+
+  testWidgets('企业接入后登录并直接进入消息', (tester) async {
     final im = _FakeImRuntime();
     await tester.pumpWidget(
       B8imApp(
@@ -242,16 +281,19 @@ void main() {
       ),
     );
 
-    expect(find.text('连接你的企业'), findsOneWidget);
+    expect(find.text('连接工作空间'), findsOneWidget);
+    expect(find.text('发现服务'), findsNothing);
+    expect(find.text('App 模块注册数'), findsNothing);
     await tester.tap(find.byKey(const ValueKey('discover-button')));
     await tester.pumpAndSettle();
 
     expect(find.text('b8im 测试机构'), findsOneWidget);
-    expect(find.text('https://api.idev.love'), findsWidgets);
-    expect(find.text('wss://ws.idev.love'), findsOneWidget);
+    expect(find.text('登录企业账号'), findsOneWidget);
+    expect(find.text('https://api.idev.love'), findsNothing);
+    expect(find.text('wss://ws.idev.love'), findsNothing);
+    expect(find.text('Organization'), findsNothing);
+    expect(find.text('Deployment'), findsNothing);
 
-    await tester.drag(find.byType(ListView), const Offset(0, -500));
-    await tester.pumpAndSettle();
     await tester.enterText(
       find.byKey(const ValueKey('login-account')).first,
       'acceptance',
@@ -266,15 +308,9 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('login-button')).first);
     await tester.pumpAndSettle();
 
-    expect(find.text('AUTH + SYNC 已完成'), findsOneWidget);
-    expect(find.text('验收用户 (acceptance)'), findsOneWidget);
-    expect(find.text('0 → 7'), findsOneWidget);
-
-    await tester.drag(find.byType(ListView).first, const Offset(0, -400));
-    await tester.pumpAndSettle();
-    await tester.ensureVisible(find.byKey(const ValueKey('open-messaging')));
-    await tester.tap(find.byKey(const ValueKey('open-messaging')));
-    await tester.pumpAndSettle();
+    expect(find.text('AUTH + SYNC 已完成'), findsNothing);
+    expect(find.text('0 → 7'), findsNothing);
+    expect(find.text('消息'), findsOneWidget);
     expect(find.text('测试好友'), findsOneWidget);
     expect(find.text('历史消息'), findsOneWidget);
 

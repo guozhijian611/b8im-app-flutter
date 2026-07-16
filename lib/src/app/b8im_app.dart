@@ -132,14 +132,57 @@ final class _B8imAppState extends State<B8imApp> {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF16A66A),
+          seedColor: const Color(0xFF2563EB),
           brightness: Brightness.light,
         ),
-        scaffoldBackgroundColor: const Color(0xFFF4F7F6),
-        inputDecorationTheme: const InputDecorationTheme(
-          border: OutlineInputBorder(),
+        scaffoldBackgroundColor: const Color(0xFFF7F8FC),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Colors.white,
+          foregroundColor: Color(0xFF111827),
+          elevation: 0,
+          surfaceTintColor: Colors.transparent,
+          centerTitle: false,
+        ),
+        cardTheme: CardThemeData(
+          color: Colors.white,
+          elevation: 0,
+          margin: EdgeInsets.zero,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+            side: const BorderSide(color: Color(0xFFE8EBF2)),
+          ),
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: const BorderSide(color: Color(0xFFDDE2EA)),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: const BorderSide(color: Color(0xFFDDE2EA)),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: const BorderSide(color: Color(0xFF2563EB), width: 1.5),
+          ),
           filled: true,
-          fillColor: Colors.white,
+          fillColor: const Color(0xFFF9FAFC),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 16,
+            vertical: 16,
+          ),
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            minimumSize: const Size(0, 52),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+            textStyle: const TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
         ),
         useMaterial3: true,
       ),
@@ -238,7 +281,7 @@ final class _BootstrapPageState extends State<BootstrapPage> {
       );
       if (mounted) setState(() => _tenant = tenant);
     } on Object catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted) setState(() => _error = _discoveryError(error));
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -275,9 +318,12 @@ final class _BootstrapPageState extends State<BootstrapPage> {
         runtime: widget.runtime,
       );
       _passwordController.clear();
-      if (mounted) setState(() => _sessionResult = result);
+      if (mounted) {
+        setState(() => _sessionResult = result);
+        await _openMessaging();
+      }
     } on Object catch (error) {
-      if (mounted) setState(() => _sessionError = error.toString());
+      if (mounted) setState(() => _sessionError = _loginError(error));
     } finally {
       if (mounted) setState(() => _sessionLoading = false);
     }
@@ -323,340 +369,429 @@ final class _BootstrapPageState extends State<BootstrapPage> {
     }
   }
 
+  Future<void> _switchTenant() async {
+    final previous = _sessionResult;
+    setState(() {
+      _tenant = null;
+      _sessionResult = null;
+      _sessionError = null;
+      _error = null;
+    });
+    _passwordController.clear();
+    if (previous != null) await previous.im.close();
+  }
+
+  String _discoveryError(Object error) {
+    if (error is TenantDiscoveryException) return error.message;
+    if (error is StateError) {
+      return '客户端安全配置异常，请更新 App 后重试';
+    }
+    if (error is FormatException) {
+      return '企业信息校验失败，请确认企业码或联系管理员';
+    }
+    return '暂时无法连接，请检查网络后重试';
+  }
+
+  String _loginError(Object error) {
+    if (error is AppApiException &&
+        (error.statusCode == 400 ||
+            error.statusCode == 401 ||
+            error.statusCode == 403 ||
+            error.statusCode == 422)) {
+      return error.message;
+    }
+    if (error is AppImConnectionException) {
+      return '消息服务连接失败，请稍后重试';
+    }
+    return '登录失败，请检查账号、密码或网络后重试';
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('b8im'), centerTitle: false),
       body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.all(20),
-          children: [
-            Text(
-              '连接你的企业',
-              style: Theme.of(
-                context,
-              ).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'Android / iOS 统一从受信线路配置启动，模块能力由服务端授权与 App 固定注册表共同决定。',
-              style: Theme.of(context).textTheme.bodyMedium,
-            ),
-            const SizedBox(height: 24),
-            TextField(
-              key: const ValueKey('enterprise-code'),
-              controller: _enterpriseCodeController,
-              autocorrect: false,
-              enableSuggestions: false,
-              textCapitalization: TextCapitalization.none,
-              decoration: const InputDecoration(
-                labelText: '企业码',
-                hintText: '例如：your_company',
-                prefixIcon: Icon(Icons.apartment_rounded),
-              ),
-              onSubmitted: (_) => _loading ? null : _discover(),
-            ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              key: const ValueKey('discover-button'),
-              onPressed: _loading ? null : _discover,
-              icon: _loading
-                  ? const SizedBox.square(
-                      dimension: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.verified_user_outlined),
-              label: Text(_loading ? '正在验证线路…' : '安全连接'),
-            ),
-            const SizedBox(height: 16),
-            _InfoRow(
-              label: '发现服务',
-              value: widget.environment.discoveryBaseUri.toString(),
-            ),
-            _InfoRow(
-              label: 'App 模块注册数',
-              value: widget.moduleRegistry.length.toString(),
-            ),
-            if (_error case final error?) ...[
-              const SizedBox(height: 16),
-              _MessageCard(
-                color: Theme.of(context).colorScheme.errorContainer,
-                icon: Icons.error_outline,
-                title: '连接失败',
-                message: error,
-              ),
-            ],
-            if (_tenant case final tenant?) ...[
-              const SizedBox(height: 16),
-              _TenantCard(tenant: tenant),
-              const SizedBox(height: 16),
-              _LoginCard(
-                accountController: _accountController,
-                passwordController: _passwordController,
-                loading: _sessionLoading,
-                os: widget.runtime.os,
-                onLogin: _connectSession,
-              ),
-            ],
-            if (_sessionError case final error?) ...[
-              const SizedBox(height: 16),
-              _MessageCard(
-                color: Theme.of(context).colorScheme.errorContainer,
-                icon: Icons.error_outline,
-                title: '登录或 IM 初始化失败',
-                message: error,
-              ),
-            ],
-            if (_sessionResult case final result?) ...[
-              const SizedBox(height: 16),
-              _SessionCard(
-                tenant: _tenant!,
-                result: result,
-                onOpenMessaging: _openMessaging,
-              ),
-            ],
-          ],
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 220),
+          switchInCurve: Curves.easeOut,
+          switchOutCurve: Curves.easeIn,
+          child: _tenant == null
+              ? _WorkspaceEntry(
+                  key: const ValueKey('workspace-entry'),
+                  controller: _enterpriseCodeController,
+                  loading: _loading,
+                  error: _error,
+                  onContinue: _discover,
+                )
+              : _LoginCard(
+                  key: ValueKey('login-${_tenant!.organization}'),
+                  tenant: _tenant!,
+                  accountController: _accountController,
+                  passwordController: _passwordController,
+                  loading: _sessionLoading,
+                  error: _sessionError,
+                  onLogin: _connectSession,
+                  onSwitchTenant: _switchTenant,
+                ),
         ),
       ),
     );
   }
 }
 
-final class _LoginCard extends StatelessWidget {
+final class _WorkspaceEntry extends StatelessWidget {
+  const _WorkspaceEntry({
+    super.key,
+    required this.controller,
+    required this.loading,
+    required this.error,
+    required this.onContinue,
+  });
+
+  final TextEditingController controller;
+  final bool loading;
+  final String? error;
+  final Future<void> Function() onContinue;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    return LayoutBuilder(
+      builder: (context, constraints) => SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 28),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: constraints.maxHeight),
+          child: IntrinsicHeight(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const SizedBox(height: 56),
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: _BrandMark(),
+                ),
+                const SizedBox(height: 28),
+                Text(
+                  '连接工作空间',
+                  style: textTheme.headlineMedium?.copyWith(
+                    color: const Color(0xFF111827),
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -0.6,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  '输入企业管理员提供的企业码，进入你的团队。',
+                  style: textTheme.bodyLarge?.copyWith(
+                    color: const Color(0xFF667085),
+                    height: 1.5,
+                  ),
+                ),
+                const SizedBox(height: 34),
+                TextField(
+                  key: const ValueKey('enterprise-code'),
+                  controller: controller,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  textCapitalization: TextCapitalization.none,
+                  textInputAction: TextInputAction.done,
+                  decoration: const InputDecoration(
+                    labelText: '企业码',
+                    hintText: '请输入企业码',
+                    prefixIcon: Icon(Icons.business_outlined),
+                  ),
+                  onSubmitted: (_) => loading ? null : onContinue(),
+                ),
+                if (error case final message?) ...[
+                  const SizedBox(height: 14),
+                  _InlineError(message: message),
+                ],
+                const SizedBox(height: 18),
+                FilledButton(
+                  key: const ValueKey('discover-button'),
+                  onPressed: loading ? null : onContinue,
+                  child: loading
+                      ? const _ButtonProgress(label: '正在连接…')
+                      : const Text('继续'),
+                ),
+                const Spacer(),
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 28),
+                  child: Text(
+                    '不知道企业码？请联系你的企业管理员',
+                    textAlign: TextAlign.center,
+                    style: textTheme.bodySmall?.copyWith(
+                      color: const Color(0xFF98A2B3),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+final class _LoginCard extends StatefulWidget {
   const _LoginCard({
+    super.key,
+    required this.tenant,
     required this.accountController,
     required this.passwordController,
     required this.loading,
-    required this.os,
+    required this.error,
     required this.onLogin,
+    required this.onSwitchTenant,
   });
 
+  final TenantConfig tenant;
   final TextEditingController accountController;
   final TextEditingController passwordController;
   final bool loading;
-  final String os;
+  final String? error;
   final Future<void> Function() onLogin;
+  final Future<void> Function() onSwitchTenant;
+
+  @override
+  State<_LoginCard> createState() => _LoginCardState();
+}
+
+final class _LoginCardState extends State<_LoginCard> {
+  bool _obscurePassword = true;
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      margin: EdgeInsets.zero,
-      child: Padding(
-        padding: const EdgeInsets.all(18),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(
-              '登录并连接 IM',
-              style: Theme.of(
-                context,
-              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+    final textTheme = Theme.of(context).textTheme;
+    return LayoutBuilder(
+      builder: (context, constraints) => SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 28),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: constraints.maxHeight),
+          child: IntrinsicHeight(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const SizedBox(height: 18),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    key: const ValueKey('switch-tenant'),
+                    onPressed: widget.loading ? null : widget.onSwitchTenant,
+                    icon: const Icon(Icons.arrow_back_rounded, size: 20),
+                    label: const Text('切换企业'),
+                  ),
+                ),
+                const SizedBox(height: 36),
+                Align(child: _TenantLogo(tenant: widget.tenant, size: 76)),
+                const SizedBox(height: 20),
+                Text(
+                  widget.tenant.siteName,
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: textTheme.headlineSmall?.copyWith(
+                    color: const Color(0xFF111827),
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -0.3,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '登录企业账号',
+                  textAlign: TextAlign.center,
+                  style: textTheme.bodyLarge?.copyWith(
+                    color: const Color(0xFF667085),
+                  ),
+                ),
+                const SizedBox(height: 36),
+                TextField(
+                  key: const ValueKey('login-account'),
+                  controller: widget.accountController,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  textInputAction: TextInputAction.next,
+                  decoration: const InputDecoration(
+                    labelText: '账号',
+                    hintText: '请输入账号',
+                    prefixIcon: Icon(Icons.person_outline_rounded),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  key: const ValueKey('login-password'),
+                  controller: widget.passwordController,
+                  obscureText: _obscurePassword,
+                  enableSuggestions: false,
+                  autocorrect: false,
+                  textInputAction: TextInputAction.done,
+                  decoration: InputDecoration(
+                    labelText: '密码',
+                    hintText: '请输入密码',
+                    prefixIcon: const Icon(Icons.lock_outline_rounded),
+                    suffixIcon: IconButton(
+                      key: const ValueKey('toggle-password'),
+                      onPressed: () =>
+                          setState(() => _obscurePassword = !_obscurePassword),
+                      icon: Icon(
+                        _obscurePassword
+                            ? Icons.visibility_outlined
+                            : Icons.visibility_off_outlined,
+                      ),
+                      tooltip: _obscurePassword ? '显示密码' : '隐藏密码',
+                    ),
+                  ),
+                  onSubmitted: (_) => widget.loading ? null : widget.onLogin(),
+                ),
+                if (widget.error case final message?) ...[
+                  const SizedBox(height: 14),
+                  _InlineError(message: message),
+                ],
+                const SizedBox(height: 20),
+                FilledButton(
+                  key: const ValueKey('login-button'),
+                  onPressed: widget.loading ? null : widget.onLogin,
+                  child: widget.loading
+                      ? const _ButtonProgress(label: '正在登录…')
+                      : const Text('登录'),
+                ),
+                const Spacer(),
+                const SizedBox(height: 28),
+              ],
             ),
-            const SizedBox(height: 6),
-            Text('当前平台：$os · 密码仅用于本次登录，不会持久化'),
-            const SizedBox(height: 16),
-            TextField(
-              key: const ValueKey('login-account'),
-              controller: accountController,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '账号',
-                prefixIcon: Icon(Icons.person_outline),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              key: const ValueKey('login-password'),
-              controller: passwordController,
-              obscureText: true,
-              enableSuggestions: false,
-              autocorrect: false,
-              decoration: const InputDecoration(
-                labelText: '密码',
-                prefixIcon: Icon(Icons.lock_outline),
-              ),
-              onSubmitted: (_) => loading ? null : onLogin(),
-            ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              key: const ValueKey('login-button'),
-              onPressed: loading ? null : onLogin,
-              icon: loading
-                  ? const SizedBox.square(
-                      dimension: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.login_rounded),
-              label: Text(loading ? '正在建立安全会话…' : '登录并同步'),
-            ),
-          ],
+          ),
         ),
       ),
     );
   }
 }
 
-final class _SessionCard extends StatelessWidget {
-  const _SessionCard({
-    required this.tenant,
-    required this.result,
-    required this.onOpenMessaging,
-  });
-
-  final TenantConfig tenant;
-  final AppSessionBootstrapResult result;
-  final Future<void> Function() onOpenMessaging;
+final class _BrandMark extends StatelessWidget {
+  const _BrandMark();
 
   @override
   Widget build(BuildContext context) {
-    final user = result.session.user;
-    final im = result.im.bootstrap;
-    return Card(
-      color: Theme.of(context).colorScheme.primaryContainer,
-      margin: EdgeInsets.zero,
-      child: Padding(
-        padding: const EdgeInsets.all(18),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const Icon(Icons.sync_lock_rounded),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'AUTH + SYNC 已完成',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-              ],
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 48,
+          height: 48,
+          decoration: BoxDecoration(
+            gradient: const LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Color(0xFF3B82F6), Color(0xFF1D4ED8)],
             ),
-            const SizedBox(height: 12),
-            _InfoRow(label: '用户', value: '${user.nickname} (${user.account})'),
-            _InfoRow(label: '授权模块', value: '${result.modules.length}'),
-            _InfoRow(label: 'IM Client', value: im.clientId),
-            _InfoRow(
-              label: '全局游标',
-              value: '${im.previousGlobalSeq} → ${im.nextGlobalSeq}',
-            ),
-            _InfoRow(label: '同步消息', value: '${im.syncedMessages.length}'),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                key: const ValueKey('open-messaging'),
-                onPressed: onOpenMessaging,
-                icon: const Icon(Icons.forum_outlined),
-                label: const Text('进入消息'),
-              ),
-            ),
-            for (final module in result.modules) ...[
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton.tonalIcon(
-                  key: ValueKey('open-module-${module.registration.moduleKey}'),
-                  onPressed: () => Navigator.of(context).push<void>(
-                    MaterialPageRoute(
-                      builder: (context) => module.registration.builder(
-                        context,
-                        module.projection,
-                        ClientModuleContext(
-                          tenant: tenant,
-                          session: result.session,
-                        ),
-                      ),
-                    ),
-                  ),
-                  icon: const Icon(Icons.extension_outlined),
-                  label: Text(module.title),
-                ),
+            borderRadius: BorderRadius.circular(15),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x332563EB),
+                blurRadius: 18,
+                offset: Offset(0, 8),
               ),
             ],
-          ],
+          ),
+          child: const Icon(
+            Icons.chat_bubble_rounded,
+            color: Colors.white,
+            size: 25,
+          ),
         ),
-      ),
+        const SizedBox(width: 13),
+        Text(
+          'b8im',
+          style: Theme.of(context).textTheme.titleLarge?.copyWith(
+            color: const Color(0xFF111827),
+            fontWeight: FontWeight.w800,
+            letterSpacing: -0.5,
+          ),
+        ),
+      ],
     );
   }
 }
 
-final class _TenantCard extends StatelessWidget {
-  const _TenantCard({required this.tenant});
+final class _TenantLogo extends StatelessWidget {
+  const _TenantLogo({required this.tenant, required this.size});
 
   final TenantConfig tenant;
+  final double size;
 
   @override
   Widget build(BuildContext context) {
-    final endpoints = tenant.routing.primary.endpoints;
-    return Card(
-      margin: EdgeInsets.zero,
-      child: Padding(
-        padding: const EdgeInsets.all(18),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  Icons.check_circle,
-                  color: Theme.of(context).colorScheme.primary,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    tenant.siteName,
-                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            _InfoRow(label: 'Organization', value: '${tenant.organization}'),
-            _InfoRow(label: 'Deployment', value: tenant.deploymentId),
-            _InfoRow(
-              label: 'Routing version',
-              value: '${tenant.routing.routingVersion}',
-            ),
-            _InfoRow(label: 'API', value: endpoints.apiServerUri.toString()),
-            _InfoRow(label: 'IM', value: endpoints.imServerUri.toString()),
-          ],
+    final fallback = Container(
+      alignment: Alignment.center,
+      color: const Color(0xFFEAF1FF),
+      child: Text(
+        tenant.siteName.trim().isEmpty ? '企' : tenant.siteName.trim()[0],
+        style: TextStyle(
+          color: const Color(0xFF2563EB),
+          fontSize: size * 0.36,
+          fontWeight: FontWeight.w800,
         ),
       ),
+    );
+    return Container(
+      width: size,
+      height: size,
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(size * 0.28),
+        border: Border.all(color: const Color(0xFFE1E7F0)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x120F172A),
+            blurRadius: 24,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: tenant.logoUri == null
+          ? fallback
+          : Image.network(
+              tenant.logoUri.toString(),
+              fit: BoxFit.cover,
+              errorBuilder: (_, _, _) => fallback,
+            ),
     );
   }
 }
 
-final class _InfoRow extends StatelessWidget {
-  const _InfoRow({required this.label, required this.value});
+final class _InlineError extends StatelessWidget {
+  const _InlineError({required this.message});
 
-  final String label;
-  final String value;
+  final String message;
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF1F2),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFFFD5D9)),
+      ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(
-            width: 132,
-            child: Text(
-              label,
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
+          const Padding(
+            padding: EdgeInsets.only(top: 1),
+            child: Icon(
+              Icons.error_outline_rounded,
+              color: Color(0xFFD92D20),
+              size: 19,
             ),
           ),
+          const SizedBox(width: 10),
           Expanded(
-            child: SelectableText(
-              value,
-              style: Theme.of(context).textTheme.bodySmall,
+            child: Text(
+              message,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: const Color(0xFFB42318),
+                height: 1.4,
+              ),
             ),
           ),
         ],
@@ -665,29 +800,23 @@ final class _InfoRow extends StatelessWidget {
   }
 }
 
-final class _MessageCard extends StatelessWidget {
-  const _MessageCard({
-    required this.color,
-    required this.icon,
-    required this.title,
-    required this.message,
-  });
+final class _ButtonProgress extends StatelessWidget {
+  const _ButtonProgress({required this.label});
 
-  final Color color;
-  final IconData icon;
-  final String title;
-  final String message;
+  final String label;
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      color: color,
-      margin: EdgeInsets.zero,
-      child: ListTile(
-        leading: Icon(icon),
-        title: Text(title),
-        subtitle: Text(message),
-      ),
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const SizedBox.square(
+          dimension: 18,
+          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+        ),
+        const SizedBox(width: 10),
+        Text(label),
+      ],
     );
   }
 }
