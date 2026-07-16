@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:b8im_app_flutter/src/app/b8im_app.dart';
 import 'package:b8im_app_flutter/src/config/app_environment.dart';
+import 'package:b8im_app_flutter/src/contacts/app_contact_models.dart';
+import 'package:b8im_app_flutter/src/contacts/app_contact_service.dart';
 import 'package:b8im_app_flutter/src/discovery/tenant_config.dart';
 import 'package:b8im_app_flutter/src/discovery/tenant_discovery_client.dart';
 import 'package:b8im_app_flutter/src/im/app_im_connection.dart';
@@ -197,6 +199,7 @@ final class _FakeMessaging implements AppMessagingGateway {
     required TenantConfig tenant,
     required AppSession session,
     required String conversationId,
+    String peerUserId = '',
     int beforeSeq = 0,
     int limit = 50,
   }) async => AppImMessagePage(
@@ -212,6 +215,59 @@ final class _FakeMessaging implements AppMessagingGateway {
     required AppSession session,
     required String conversationId,
   }) async => 1;
+}
+
+final class _FakeContacts implements AppContactGateway {
+  @override
+  Future<List<AppContact>> fetchContacts({
+    required TenantConfig tenant,
+    required AppSession session,
+    String keyword = '',
+  }) async => const [
+    AppContact(
+      id: '2',
+      userId: 'peer-01',
+      account: 'peer',
+      nickname: '测试好友',
+      signature: '产品部',
+      avatarUrl: '',
+      mobile: '',
+      imShortNo: '10002',
+      statusText: '正常',
+      remark: '',
+      relationStatus: 'friend',
+      isSystem: false,
+    ),
+  ];
+
+  @override
+  Future<List<AppFriendRequest>> fetchFriendRequests({
+    required TenantConfig tenant,
+    required AppSession session,
+  }) async => const [];
+
+  @override
+  Future<List<AppContact>> searchUsers({
+    required TenantConfig tenant,
+    required AppSession session,
+    required String keyword,
+  }) async => fetchContacts(tenant: tenant, session: session);
+
+  @override
+  Future<String> sendFriendRequest({
+    required TenantConfig tenant,
+    required AppSession session,
+    required String userId,
+    required String message,
+  }) async => '已是好友';
+
+  @override
+  Future<void> handleFriendRequest({
+    required TenantConfig tenant,
+    required AppSession session,
+    required int requestId,
+    required bool accept,
+  }) async {}
 }
 
 AppImMessage _message(
@@ -252,6 +308,7 @@ void main() {
         deviceIdLoader: () async => '0123456789abcdef0123456789abcdef',
         sessionBootstrapGateway: _FakeSessionBootstrap(_FakeImRuntime()),
         messagingGateway: _FakeMessaging(),
+        contactGateway: _FakeContacts(),
         runtime: const AppClientRuntime(os: 'ios'),
       ),
     );
@@ -277,11 +334,12 @@ void main() {
         deviceIdLoader: () async => '0123456789abcdef0123456789abcdef',
         sessionBootstrapGateway: _FakeSessionBootstrap(im),
         messagingGateway: _FakeMessaging(),
+        contactGateway: _FakeContacts(),
         runtime: const AppClientRuntime(os: 'ios'),
       ),
     );
 
-    expect(find.text('连接工作空间'), findsOneWidget);
+    expect(find.text('欢迎使用 B8 IM'), findsOneWidget);
     expect(find.text('发现服务'), findsNothing);
     expect(find.text('App 模块注册数'), findsNothing);
     await tester.tap(find.byKey(const ValueKey('discover-button')));
@@ -311,8 +369,21 @@ void main() {
     expect(find.text('AUTH + SYNC 已完成'), findsNothing);
     expect(find.text('0 → 7'), findsNothing);
     expect(find.text('消息'), findsOneWidget);
+    expect(find.text('通讯录'), findsOneWidget);
+    expect(find.text('发现'), findsOneWidget);
+    expect(find.text('我的'), findsOneWidget);
     expect(find.text('测试好友'), findsOneWidget);
     expect(find.text('历史消息'), findsOneWidget);
+    expect(find.byType(BackButton), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('bottom-tab-1')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('contacts-list')), findsOneWidget);
+    expect(find.byKey(const ValueKey('contact-peer-01')), findsOneWidget);
+    expect(find.byType(BackButton), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('bottom-tab-0')));
+    await tester.pumpAndSettle();
 
     await tester.tap(
       find.byKey(const ValueKey('conversation-conversation-01')),

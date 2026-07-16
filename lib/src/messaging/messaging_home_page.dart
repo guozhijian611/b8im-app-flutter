@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../app/app_theme.dart';
 import '../discovery/tenant_config.dart';
 import '../im/app_im_connection.dart';
 import '../media/app_media_picker.dart';
@@ -20,6 +21,8 @@ final class MessagingHomePage extends StatefulWidget {
     required this.media,
     required this.mediaPicker,
     this.beforeMediaUpload,
+    this.onOpenContacts,
+    this.onUnreadChanged,
   });
 
   final TenantConfig tenant;
@@ -29,12 +32,15 @@ final class MessagingHomePage extends StatefulWidget {
   final AppMediaGateway media;
   final AppMediaPickerGateway mediaPicker;
   final Future<void> Function(int size)? beforeMediaUpload;
+  final VoidCallback? onOpenContacts;
+  final ValueChanged<int>? onUnreadChanged;
 
   @override
   State<MessagingHomePage> createState() => _MessagingHomePageState();
 }
 
 final class _MessagingHomePageState extends State<MessagingHomePage> {
+  final TextEditingController _searchController = TextEditingController();
   StreamSubscription<AppImEvent>? _eventSubscription;
   List<AppImConversation> _conversations = const [];
   String? _error;
@@ -66,6 +72,7 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
   @override
   void dispose() {
     unawaited(_eventSubscription?.cancel());
+    _searchController.dispose();
     super.dispose();
   }
 
@@ -86,6 +93,9 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
           _conversations = conversations;
           _error = null;
         });
+        widget.onUnreadChanged?.call(
+          conversations.fold(0, (total, item) => total + item.unreadCount),
+        );
       }
     } on Object catch (error) {
       if (mounted) setState(() => _error = error.toString());
@@ -122,75 +132,48 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
 
   @override
   Widget build(BuildContext context) {
-    final content = switch ((_loading, _error, _conversations.isEmpty)) {
+    final keyword = _searchController.text.trim().toLowerCase();
+    final visibleConversations = keyword.isEmpty
+        ? _conversations
+        : _conversations
+              .where((conversation) {
+                return conversation.title.toLowerCase().contains(keyword) ||
+                    conversation.lastMessageSummary.toLowerCase().contains(
+                      keyword,
+                    );
+              })
+              .toList(growable: false);
+    final content = switch ((_loading, _error, visibleConversations.isEmpty)) {
       (true, _, _) => const Center(child: CircularProgressIndicator()),
       (false, final String error, _) => _MessagingError(
         message: error,
         onRetry: _load,
       ),
-      (false, null, true) => const Center(child: Text('暂无会话，收到或发送消息后会显示在这里')),
+      (false, null, true) => B8EmptyState(
+        icon: Icons.chat_bubble_outline_rounded,
+        title: keyword.isEmpty ? '暂无会话' : '没有找到相关会话',
+        message: keyword.isEmpty ? '从通讯录选择联系人，开始第一段对话' : '请尝试其他关键词',
+        action: keyword.isEmpty && widget.onOpenContacts != null
+            ? TextButton.icon(
+                onPressed: widget.onOpenContacts,
+                icon: const Icon(Icons.contacts_outlined),
+                label: const Text('打开通讯录'),
+              )
+            : null,
+      ),
       _ => RefreshIndicator(
         onRefresh: _load,
         child: ListView.separated(
           key: const ValueKey('conversation-list'),
-          padding: const EdgeInsets.symmetric(vertical: 8),
-          itemCount: _conversations.length,
-          separatorBuilder: (_, _) => const Divider(height: 1),
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+          itemCount: visibleConversations.length,
+          separatorBuilder: (_, _) => const SizedBox(height: 10),
           itemBuilder: (context, index) {
-            final conversation = _conversations[index];
-            return ListTile(
+            final conversation = visibleConversations[index];
+            return _ConversationCard(
               key: ValueKey('conversation-${conversation.conversationId}'),
+              conversation: conversation,
               onTap: () => _openConversation(conversation),
-              leading: CircleAvatar(
-                backgroundImage: conversation.avatarUrl.isEmpty
-                    ? null
-                    : NetworkImage(conversation.avatarUrl),
-                child: conversation.avatarUrl.isEmpty
-                    ? Text(_initial(conversation.title))
-                    : null,
-              ),
-              title: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      conversation.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  if (conversation.isMuted)
-                    const Padding(
-                      padding: EdgeInsets.only(left: 6),
-                      child: Icon(Icons.volume_off_outlined, size: 16),
-                    ),
-                ],
-              ),
-              subtitle: Text(
-                conversation.lastMessageSummary.isEmpty
-                    ? '暂无消息'
-                    : conversation.lastMessageSummary,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              trailing: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  Text(
-                    _shortTime(conversation.lastMessageTime),
-                    style: Theme.of(context).textTheme.labelSmall,
-                  ),
-                  const SizedBox(height: 4),
-                  if (conversation.unreadCount > 0)
-                    Badge(
-                      label: Text(
-                        conversation.unreadCount > 99
-                            ? '99+'
-                            : '${conversation.unreadCount}',
-                      ),
-                    ),
-                ],
-              ),
             );
           },
         ),
@@ -198,13 +181,14 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
     };
     return Scaffold(
       appBar: AppBar(
-        title: const Text('消息'),
+        automaticallyImplyLeading: false,
+        title: const Text('B8 IM'),
         actions: [
           IconButton(
-            key: const ValueKey('refresh-conversations'),
-            onPressed: _loading ? null : _load,
-            icon: const Icon(Icons.refresh_rounded),
-            tooltip: '刷新会话',
+            key: const ValueKey('start-chat-action'),
+            onPressed: widget.onOpenContacts,
+            icon: const Icon(Icons.add_rounded),
+            tooltip: '发起聊天',
           ),
         ],
       ),
@@ -215,8 +199,96 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
               status: _connectionStatus,
               onReconnect: _reconnect,
             ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 4, 20, 6),
+            child: TextField(
+              key: const ValueKey('conversation-search'),
+              controller: _searchController,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                hintText: '搜索联系人、群组、消息',
+                prefixIcon: Icon(Icons.search_rounded),
+                isDense: true,
+              ),
+            ),
+          ),
           Expanded(child: content),
         ],
+      ),
+    );
+  }
+}
+
+final class _ConversationCard extends StatelessWidget {
+  const _ConversationCard({
+    super.key,
+    required this.conversation,
+    required this.onTap,
+  });
+
+  final AppImConversation conversation;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: ListTile(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        onTap: onTap,
+        leading: Badge(
+          isLabelVisible: conversation.unreadCount > 0,
+          label: Text(
+            conversation.unreadCount > 99
+                ? '99+'
+                : '${conversation.unreadCount}',
+          ),
+          child: B8Avatar(
+            label: conversation.title,
+            imageUrl: conversation.avatarUrl,
+            size: 50,
+            backgroundColor: const Color(0xFFBCEBD2),
+          ),
+        ),
+        title: Row(
+          children: [
+            Expanded(
+              child: Text(
+                conversation.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            Text(
+              _shortTime(conversation.lastMessageTime),
+              style: Theme.of(
+                context,
+              ).textTheme.labelSmall?.copyWith(color: B8Colors.muted),
+            ),
+          ],
+        ),
+        subtitle: Padding(
+          padding: const EdgeInsets.only(top: 5),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  conversation.lastMessageSummary.isEmpty
+                      ? '暂无消息'
+                      : conversation.lastMessageSummary,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: B8Colors.muted),
+                ),
+              ),
+              if (conversation.isMuted)
+                const Icon(
+                  Icons.volume_off_outlined,
+                  size: 16,
+                  color: B8Colors.muted,
+                ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -262,6 +334,15 @@ final class _ConversationPageState extends State<ConversationPage> {
   bool _loadingOlder = false;
   bool _sending = false;
   late AppImConnectionStatus _connectionStatus;
+  String? _resolvedConversationId;
+
+  String get _conversationId =>
+      _resolvedConversationId ?? widget.conversation.conversationId;
+
+  String get _requestConversationId =>
+      widget.conversation.isVirtual && _resolvedConversationId == null
+      ? ''
+      : _conversationId;
 
   List<AppImMessage> get _orderedMessages {
     final values = _messages.values.toList();
@@ -272,6 +353,9 @@ final class _ConversationPageState extends State<ConversationPage> {
   @override
   void initState() {
     super.initState();
+    if (!widget.conversation.isVirtual) {
+      _resolvedConversationId = widget.conversation.conversationId;
+    }
     _connectionStatus = widget.im.connectionStatus;
     _eventSubscription = widget.im.events.listen(
       (event) {
@@ -286,7 +370,10 @@ final class _ConversationPageState extends State<ConversationPage> {
         }
         final message = event.message;
         if (message != null &&
-            message.conversationId == widget.conversation.conversationId) {
+            (message.conversationId == _conversationId ||
+                (widget.conversation.isVirtual &&
+                    message.senderId ==
+                        widget.conversation.peerUser?.userId))) {
           _merge([message]);
           if (event.command == 'push') unawaited(_markRead());
         }
@@ -315,7 +402,10 @@ final class _ConversationPageState extends State<ConversationPage> {
       final page = await widget.messaging.fetchMessages(
         tenant: widget.tenant,
         session: widget.session,
-        conversationId: widget.conversation.conversationId,
+        conversationId: _requestConversationId,
+        peerUserId: _resolvedConversationId == null
+            ? widget.conversation.peerUser?.userId ?? ''
+            : '',
       );
       _merge(page.messages, notify: false);
       if (mounted) {
@@ -340,7 +430,10 @@ final class _ConversationPageState extends State<ConversationPage> {
       final page = await widget.messaging.fetchMessages(
         tenant: widget.tenant,
         session: widget.session,
-        conversationId: widget.conversation.conversationId,
+        conversationId: _requestConversationId,
+        peerUserId: _resolvedConversationId == null
+            ? widget.conversation.peerUser?.userId ?? ''
+            : '',
         beforeSeq: _beforeSeq,
       );
       _merge(page.messages, notify: false);
@@ -359,6 +452,8 @@ final class _ConversationPageState extends State<ConversationPage> {
 
   Future<void> _markRead() async {
     if (_messages.isEmpty) return;
+    final conversationId = _resolvedConversationId;
+    if (conversationId == null || conversationId.isEmpty) return;
     try {
       final messages = _orderedMessages;
       if (widget.im.isConnected) {
@@ -374,14 +469,14 @@ final class _ConversationPageState extends State<ConversationPage> {
           _readAcknowledged.add(message.messageId);
         }
         await widget.im.markConversationRead(
-          conversationId: widget.conversation.conversationId,
+          conversationId: conversationId,
           lastReadMessageId: messages.last.messageId,
         );
       } else {
         await widget.messaging.markRead(
           tenant: widget.tenant,
           session: widget.session,
-          conversationId: widget.conversation.conversationId,
+          conversationId: conversationId,
         );
       }
     } on Object catch (error) {
@@ -389,7 +484,7 @@ final class _ConversationPageState extends State<ConversationPage> {
         await widget.messaging.markRead(
           tenant: widget.tenant,
           session: widget.session,
-          conversationId: widget.conversation.conversationId,
+          conversationId: conversationId,
         );
       } on Object {
         if (mounted) setState(() => _error = error.toString());
@@ -407,7 +502,7 @@ final class _ConversationPageState extends State<ConversationPage> {
     try {
       final message = await widget.im.sendText(
         conversationType: widget.conversation.conversationType,
-        conversationId: widget.conversation.conversationId,
+        conversationId: _resolvedConversationId,
         toUserId: widget.conversation.peerUser?.userId,
         text: text,
       );
@@ -442,7 +537,7 @@ final class _ConversationPageState extends State<ConversationPage> {
       );
       final message = await widget.im.sendAsset(
         conversationType: widget.conversation.conversationType,
-        conversationId: widget.conversation.conversationId,
+        conversationId: _resolvedConversationId,
         toUserId: widget.conversation.peerUser?.userId,
         messageType: kind.messageType,
         fileId: uploaded.fileId,
@@ -492,6 +587,10 @@ final class _ConversationPageState extends State<ConversationPage> {
 
   void _merge(Iterable<AppImMessage> messages, {bool notify = true}) {
     for (final message in messages) {
+      if (_resolvedConversationId == null &&
+          message.conversationId.isNotEmpty) {
+        _resolvedConversationId = message.conversationId;
+      }
       _messages[message.messageId] = message;
       if (message.deliveryStatus case final status?) {
         _advanceDelivery(message.messageId, status);
@@ -501,7 +600,7 @@ final class _ConversationPageState extends State<ConversationPage> {
   }
 
   void _applyReceipt(AppImReceipt receipt) {
-    if (receipt.conversationId != widget.conversation.conversationId ||
+    if (receipt.conversationId != _conversationId ||
         receipt.senderId != widget.session.user.userId) {
       return;
     }
@@ -510,7 +609,7 @@ final class _ConversationPageState extends State<ConversationPage> {
   }
 
   void _applyConversationRead(AppImConversationReadState read) {
-    if (read.conversationId != widget.conversation.conversationId ||
+    if (read.conversationId != _conversationId ||
         read.userId == widget.session.user.userId) {
       return;
     }
@@ -598,7 +697,8 @@ final class _ConversationPageState extends State<ConversationPage> {
                     ),
             ),
             const Divider(height: 1),
-            Padding(
+            Container(
+              color: Colors.white,
               padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
               child: Row(
                 children: [
@@ -672,6 +772,8 @@ final class _MessageBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final foreground = outgoing ? Colors.white : B8Colors.text;
+    final detail = outgoing ? Colors.white70 : B8Colors.muted;
     return Align(
       alignment: outgoing ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -679,43 +781,55 @@ final class _MessageBubble extends StatelessWidget {
         margin: const EdgeInsets.symmetric(vertical: 5),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
-          color: outgoing
-              ? Theme.of(context).colorScheme.primaryContainer
-              : Theme.of(context).colorScheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(16),
+          color: outgoing ? B8Colors.primary : Colors.white,
+          borderRadius: BorderRadius.only(
+            topLeft: const Radius.circular(18),
+            topRight: const Radius.circular(18),
+            bottomLeft: Radius.circular(outgoing ? 18 : 5),
+            bottomRight: Radius.circular(outgoing ? 5 : 18),
+          ),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (!outgoing && message.senderUser != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 3),
-                child: Text(
-                  message.senderUser!.displayName,
-                  style: Theme.of(context).textTheme.labelSmall,
+        child: IconTheme(
+          data: IconThemeData(color: foreground),
+          child: DefaultTextStyle.merge(
+            style: TextStyle(color: foreground),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (!outgoing && message.senderUser != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 3),
+                    child: Text(
+                      message.senderUser!.displayName,
+                      style: TextStyle(color: detail, fontSize: 11),
+                    ),
+                  ),
+                if (message.messageType == 2 || message.messageType == 3)
+                  _AssetMessageContent(
+                    message: message,
+                    tenant: tenant,
+                    session: session,
+                    media: media,
+                  )
+                else
+                  Text(
+                    message.displayText,
+                    style: TextStyle(color: foreground),
+                  ),
+                const SizedBox(height: 3),
+                Text(
+                  _shortTime(message.createTime),
+                  style: TextStyle(color: detail, fontSize: 11),
                 ),
-              ),
-            if (message.messageType == 2 || message.messageType == 3)
-              _AssetMessageContent(
-                message: message,
-                tenant: tenant,
-                session: session,
-                media: media,
-              )
-            else
-              Text(message.displayText),
-            const SizedBox(height: 3),
-            Text(
-              _shortTime(message.createTime),
-              style: Theme.of(context).textTheme.labelSmall,
+                if (outgoing && deliveryStatus != null)
+                  Text(
+                    deliveryStatus!.label,
+                    key: ValueKey('delivery-${message.messageId}'),
+                    style: TextStyle(color: detail, fontSize: 11),
+                  ),
+              ],
             ),
-            if (outgoing && deliveryStatus != null)
-              Text(
-                deliveryStatus!.label,
-                key: ValueKey('delivery-${message.messageId}'),
-                style: Theme.of(context).textTheme.labelSmall,
-              ),
-          ],
+          ),
         ),
       ),
     );
@@ -929,11 +1043,6 @@ final class _MessagingError extends StatelessWidget {
       ),
     );
   }
-}
-
-String _initial(String value) {
-  final normalized = value.trim();
-  return normalized.isEmpty ? '?' : normalized.characters.first;
 }
 
 String _formatBytes(int bytes) {

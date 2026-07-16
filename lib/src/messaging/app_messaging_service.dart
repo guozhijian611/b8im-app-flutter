@@ -13,6 +13,7 @@ abstract interface class AppMessagingGateway {
     required TenantConfig tenant,
     required AppSession session,
     required String conversationId,
+    String peerUserId = '',
     int beforeSeq = 0,
     int limit = 50,
   });
@@ -50,10 +51,16 @@ final class AppMessagingService implements AppMessagingGateway {
     required TenantConfig tenant,
     required AppSession session,
     required String conversationId,
+    String peerUserId = '',
     int beforeSeq = 0,
     int limit = 50,
   }) async {
-    if (conversationId.trim().isEmpty || beforeSeq < 0) {
+    final normalizedConversationId = conversationId.trim();
+    final normalizedPeerUserId = peerUserId.trim();
+    if ((normalizedConversationId.isEmpty && normalizedPeerUserId.isEmpty) ||
+        (normalizedConversationId.isNotEmpty &&
+            normalizedPeerUserId.isNotEmpty) ||
+        beforeSeq < 0) {
       throw const FormatException('消息分页参数无效');
     }
     final data = await api.request(
@@ -61,7 +68,10 @@ final class AppMessagingService implements AppMessagingGateway {
       '/saimulti/app/im/messages',
       accessToken: session.accessToken,
       query: {
-        'conversation_id': conversationId.trim(),
+        if (normalizedConversationId.isNotEmpty)
+          'conversation_id': normalizedConversationId,
+        if (normalizedPeerUserId.isNotEmpty)
+          'peer_user_id': normalizedPeerUserId,
         'before_seq': beforeSeq.toString(),
         'after_seq': '0',
         'limit': limit.clamp(1, 100).toString(),

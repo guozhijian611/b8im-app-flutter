@@ -126,8 +126,18 @@ final class AppImUserSummary {
 
   factory AppImUserSummary.fromJson(Object? value, String field) {
     final map = imMap(value, field);
-    final nickname = imString(map, 'nickname', '$field.nickname', allowEmpty: true);
-    final account = imString(map, 'account', '$field.account', allowEmpty: true);
+    final nickname = imString(
+      map,
+      'nickname',
+      '$field.nickname',
+      allowEmpty: true,
+    );
+    final account = imString(
+      map,
+      'account',
+      '$field.account',
+      allowEmpty: true,
+    );
     final companyName = imString(
       map,
       'company_name',
@@ -140,9 +150,11 @@ final class AppImUserSummary {
       '$field.organization_name',
       allowEmpty: true,
     );
-    final resolvedCompany =
-        companyName.isNotEmpty ? companyName : organizationName;
-    final isCross = map['is_cross_organization'] == true ||
+    final resolvedCompany = companyName.isNotEmpty
+        ? companyName
+        : organizationName;
+    final isCross =
+        map['is_cross_organization'] == true ||
         map['is_cross_organization'] == 1 ||
         map['is_cross_organization'] == '1';
     final serverDisplay = imString(
@@ -178,12 +190,12 @@ final class AppImUserSummary {
   final String displayNameOverride;
 
   String get displayName => ContactDisplayLabel.format(
-        nickname: nickname,
-        account: account,
-        companyName: companyName,
-        isCrossOrganization: isCrossOrganization,
-        serverDisplayName: displayNameOverride,
-      );
+    nickname: nickname,
+    account: account,
+    companyName: companyName,
+    isCrossOrganization: isCrossOrganization,
+    serverDisplayName: displayNameOverride,
+  );
 }
 
 final class AppImConversation {
@@ -200,7 +212,34 @@ final class AppImConversation {
     required this.isPinned,
     required this.isMuted,
     required this.avatarUrl,
+    this.isVirtual = false,
   });
+
+  factory AppImConversation.virtualSingle({
+    required String userId,
+    required String title,
+    required String account,
+    required String avatarUrl,
+  }) => AppImConversation(
+    conversationId: 'virtual:$userId',
+    conversationType: 1,
+    title: title,
+    peerUser: AppImUserSummary(
+      userId: userId,
+      account: account,
+      nickname: title,
+      avatarUrl: avatarUrl,
+    ),
+    lastMessageId: '',
+    lastMessageSeq: 0,
+    lastMessageSummary: '',
+    lastMessageTime: '',
+    unreadCount: 0,
+    isPinned: false,
+    isMuted: false,
+    avatarUrl: avatarUrl,
+    isVirtual: true,
+  );
 
   factory AppImConversation.fromJson(Object? value) {
     final map = imMap(value, 'conversation');
@@ -263,6 +302,7 @@ final class AppImConversation {
   final bool isPinned;
   final bool isMuted;
   final String avatarUrl;
+  final bool isVirtual;
 }
 
 final class AppImMessage {

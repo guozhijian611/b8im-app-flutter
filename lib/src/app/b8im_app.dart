@@ -3,13 +3,13 @@ import 'dart:async';
 import 'package:b8im_file_media_module/b8im_file_media_module.dart';
 import 'package:flutter/material.dart';
 
+import '../contacts/app_contact_service.dart';
 import '../config/app_environment.dart';
 import '../discovery/tenant_config.dart';
 import '../discovery/tenant_discovery_client.dart';
 import '../im/app_im_connection.dart';
 import '../im/web_socket_im_socket.dart';
 import '../messaging/app_messaging_service.dart';
-import '../messaging/messaging_home_page.dart';
 import '../media/app_media_picker.dart';
 import '../media/app_media_service.dart';
 import '../modules/app_module_catalog.dart';
@@ -21,6 +21,8 @@ import '../session/app_session_bootstrapper.dart';
 import '../session/app_session_service.dart';
 import '../storage/device_identity_store.dart';
 import '../storage/im_sync_cursor_store.dart';
+import 'app_home_shell.dart';
+import 'app_theme.dart';
 
 final class B8imApp extends StatefulWidget {
   const B8imApp({
@@ -31,6 +33,7 @@ final class B8imApp extends StatefulWidget {
     this.moduleRegistry,
     this.sessionBootstrapGateway,
     this.messagingGateway,
+    this.contactGateway,
     this.mediaGateway,
     this.mediaPicker,
     this.runtime,
@@ -42,6 +45,7 @@ final class B8imApp extends StatefulWidget {
   final ClientModuleRegistry? moduleRegistry;
   final AppSessionBootstrapGateway? sessionBootstrapGateway;
   final AppMessagingGateway? messagingGateway;
+  final AppContactGateway? contactGateway;
   final AppMediaGateway? mediaGateway;
   final AppMediaPickerGateway? mediaPicker;
   final AppClientRuntime? runtime;
@@ -57,6 +61,7 @@ final class _B8imAppState extends State<B8imApp> {
   late final ClientModuleRegistry _moduleRegistry;
   late final AppSessionBootstrapGateway _sessionBootstrapGateway;
   late final AppMessagingGateway _messagingGateway;
+  late final AppContactGateway _contactGateway;
   late final AppMediaGateway _mediaGateway;
   late final AppMediaPickerGateway _mediaPicker;
   late final AppClientRuntime _runtime;
@@ -87,6 +92,7 @@ final class _B8imAppState extends State<B8imApp> {
     AppApiClient? apiClient;
     if (widget.sessionBootstrapGateway == null ||
         widget.messagingGateway == null ||
+        widget.contactGateway == null ||
         widget.mediaGateway == null) {
       apiClient = AppApiClient();
       _ownedApiClient = apiClient;
@@ -107,6 +113,7 @@ final class _B8imAppState extends State<B8imApp> {
     }
     _messagingGateway =
         widget.messagingGateway ?? AppMessagingService(apiClient!);
+    _contactGateway = widget.contactGateway ?? AppContactService(apiClient!);
     if (widget.mediaGateway case final gateway?) {
       _mediaGateway = gateway;
     } else {
@@ -130,62 +137,7 @@ final class _B8imAppState extends State<B8imApp> {
     return MaterialApp(
       title: 'b8im',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF2563EB),
-          brightness: Brightness.light,
-        ),
-        scaffoldBackgroundColor: const Color(0xFFF7F8FC),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Colors.white,
-          foregroundColor: Color(0xFF111827),
-          elevation: 0,
-          surfaceTintColor: Colors.transparent,
-          centerTitle: false,
-        ),
-        cardTheme: CardThemeData(
-          color: Colors.white,
-          elevation: 0,
-          margin: EdgeInsets.zero,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
-            side: const BorderSide(color: Color(0xFFE8EBF2)),
-          ),
-        ),
-        inputDecorationTheme: InputDecorationTheme(
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-            borderSide: const BorderSide(color: Color(0xFFDDE2EA)),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-            borderSide: const BorderSide(color: Color(0xFFDDE2EA)),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(14),
-            borderSide: const BorderSide(color: Color(0xFF2563EB), width: 1.5),
-          ),
-          filled: true,
-          fillColor: const Color(0xFFF9FAFC),
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 16,
-          ),
-        ),
-        filledButtonTheme: FilledButtonThemeData(
-          style: FilledButton.styleFrom(
-            minimumSize: const Size(0, 52),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(14),
-            ),
-            textStyle: const TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ),
-        useMaterial3: true,
-      ),
+      theme: B8Theme.light(),
       home: BootstrapPage(
         environment: _environment,
         discoveryGateway: _discoveryGateway,
@@ -193,6 +145,7 @@ final class _B8imAppState extends State<B8imApp> {
         moduleRegistry: _moduleRegistry,
         sessionBootstrapGateway: _sessionBootstrapGateway,
         messagingGateway: _messagingGateway,
+        contactGateway: _contactGateway,
         mediaGateway: _mediaGateway,
         mediaPicker: _mediaPicker,
         runtime: _runtime,
@@ -210,6 +163,7 @@ final class BootstrapPage extends StatefulWidget {
     required this.moduleRegistry,
     required this.sessionBootstrapGateway,
     required this.messagingGateway,
+    required this.contactGateway,
     required this.mediaGateway,
     required this.mediaPicker,
     required this.runtime,
@@ -221,6 +175,7 @@ final class BootstrapPage extends StatefulWidget {
   final ClientModuleRegistry moduleRegistry;
   final AppSessionBootstrapGateway sessionBootstrapGateway;
   final AppMessagingGateway messagingGateway;
+  final AppContactGateway contactGateway;
   final AppMediaGateway mediaGateway;
   final AppMediaPickerGateway mediaPicker;
   final AppClientRuntime runtime;
@@ -320,7 +275,7 @@ final class _BootstrapPageState extends State<BootstrapPage> {
       _passwordController.clear();
       if (mounted) {
         setState(() => _sessionResult = result);
-        await _openMessaging();
+        await _openAppHome();
       }
     } on Object catch (error) {
       if (mounted) setState(() => _sessionError = _loginError(error));
@@ -329,7 +284,7 @@ final class _BootstrapPageState extends State<BootstrapPage> {
     }
   }
 
-  Future<void> _openMessaging() async {
+  Future<void> _openAppHome() async {
     final tenant = _tenant;
     final result = _sessionResult;
     if (tenant == null || result == null) return;
@@ -344,13 +299,16 @@ final class _BootstrapPageState extends State<BootstrapPage> {
           )
         : null;
     try {
-      await Navigator.of(context).push<void>(
+      final logout = await Navigator.of(context).push<bool>(
         MaterialPageRoute(
-          builder: (_) => MessagingHomePage(
+          settings: const RouteSettings(name: 'app-home'),
+          builder: (shellContext) => AppHomeShell(
             tenant: tenant,
             session: result.session,
             im: result.im,
+            modules: result.modules,
             messaging: widget.messagingGateway,
+            contacts: widget.contactGateway,
             media: widget.mediaGateway,
             mediaPicker: widget.mediaPicker,
             beforeMediaUpload: preflightClient == null
@@ -361,9 +319,23 @@ final class _BootstrapPageState extends State<BootstrapPage> {
                       throw FileMediaModuleException(check.reason);
                     }
                   },
+            onLogout: () async {
+              final navigator = Navigator.of(shellContext);
+              navigator.popUntil((route) => route.settings.name == 'app-home');
+              navigator.pop(true);
+            },
           ),
         ),
       );
+      if (logout == true) {
+        await result.im.close();
+        if (mounted) {
+          setState(() {
+            _sessionResult = null;
+            _sessionError = null;
+          });
+        }
+      }
     } finally {
       preflightClient?.close();
     }
@@ -465,24 +437,23 @@ final class _WorkspaceEntry extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 const SizedBox(height: 56),
-                const Align(
-                  alignment: Alignment.centerLeft,
-                  child: _BrandMark(),
-                ),
-                const SizedBox(height: 28),
+                const Align(child: _BrandMark()),
+                const SizedBox(height: 34),
                 Text(
-                  '连接工作空间',
+                  '欢迎使用 B8 IM',
+                  textAlign: TextAlign.center,
                   style: textTheme.headlineMedium?.copyWith(
-                    color: const Color(0xFF111827),
+                    color: B8Colors.text,
                     fontWeight: FontWeight.w800,
                     letterSpacing: -0.6,
                   ),
                 ),
                 const SizedBox(height: 10),
                 Text(
-                  '输入企业管理员提供的企业码，进入你的团队。',
+                  '请输入企业码，连接到您的企业',
+                  textAlign: TextAlign.center,
                   style: textTheme.bodyLarge?.copyWith(
-                    color: const Color(0xFF667085),
+                    color: B8Colors.muted,
                     height: 1.5,
                   ),
                 ),
@@ -519,9 +490,7 @@ final class _WorkspaceEntry extends StatelessWidget {
                   child: Text(
                     '不知道企业码？请联系你的企业管理员',
                     textAlign: TextAlign.center,
-                    style: textTheme.bodySmall?.copyWith(
-                      color: const Color(0xFF98A2B3),
-                    ),
+                    style: textTheme.bodySmall?.copyWith(color: B8Colors.muted),
                   ),
                 ),
               ],
@@ -591,7 +560,7 @@ final class _LoginCardState extends State<_LoginCard> {
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: textTheme.headlineSmall?.copyWith(
-                    color: const Color(0xFF111827),
+                    color: B8Colors.text,
                     fontWeight: FontWeight.w800,
                     letterSpacing: -0.3,
                   ),
@@ -600,9 +569,7 @@ final class _LoginCardState extends State<_LoginCard> {
                 Text(
                   '登录企业账号',
                   textAlign: TextAlign.center,
-                  style: textTheme.bodyLarge?.copyWith(
-                    color: const Color(0xFF667085),
-                  ),
+                  style: textTheme.bodyLarge?.copyWith(color: B8Colors.muted),
                 ),
                 const SizedBox(height: 36),
                 TextField(
@@ -681,28 +648,28 @@ final class _BrandMark extends StatelessWidget {
             gradient: const LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [Color(0xFF3B82F6), Color(0xFF1D4ED8)],
+              colors: [B8Colors.primary, B8Colors.primaryDark],
             ),
             borderRadius: BorderRadius.circular(15),
             boxShadow: const [
               BoxShadow(
-                color: Color(0x332563EB),
+                color: Color(0x3325C06D),
                 blurRadius: 18,
                 offset: Offset(0, 8),
               ),
             ],
           ),
           child: const Icon(
-            Icons.chat_bubble_rounded,
+            Icons.apartment_rounded,
             color: Colors.white,
             size: 25,
           ),
         ),
         const SizedBox(width: 13),
         Text(
-          'b8im',
+          'B8 IM',
           style: Theme.of(context).textTheme.titleLarge?.copyWith(
-            color: const Color(0xFF111827),
+            color: B8Colors.text,
             fontWeight: FontWeight.w800,
             letterSpacing: -0.5,
           ),
@@ -722,11 +689,11 @@ final class _TenantLogo extends StatelessWidget {
   Widget build(BuildContext context) {
     final fallback = Container(
       alignment: Alignment.center,
-      color: const Color(0xFFEAF1FF),
+      color: B8Colors.mint,
       child: Text(
         tenant.siteName.trim().isEmpty ? '企' : tenant.siteName.trim()[0],
         style: TextStyle(
-          color: const Color(0xFF2563EB),
+          color: B8Colors.primaryDark,
           fontSize: size * 0.36,
           fontWeight: FontWeight.w800,
         ),
@@ -739,7 +706,7 @@ final class _TenantLogo extends StatelessWidget {
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(size * 0.28),
-        border: Border.all(color: const Color(0xFFE1E7F0)),
+        border: Border.all(color: B8Colors.line),
         boxShadow: const [
           BoxShadow(
             color: Color(0x120F172A),

@@ -31,6 +31,10 @@ final class AppUser {
     required this.userId,
     required this.account,
     required this.nickname,
+    this.avatarUrl = '',
+    this.signature = '',
+    this.imShortNo = '',
+    this.mobile = '',
   });
 
   factory AppUser.fromJson(Object? value) {
@@ -40,6 +44,10 @@ final class AppUser {
       userId: _stringValue(map['user_id'], 'user.user_id'),
       account: _stringValue(map['account'], 'user.account'),
       nickname: _stringValue(map['nickname'], 'user.nickname'),
+      avatarUrl: _optionalStringValue(map['avatar_url']),
+      signature: _optionalStringValue(map['signature']),
+      imShortNo: _optionalStringValue(map['im_short_no']),
+      mobile: _optionalStringValue(map['mobile']),
     );
   }
 
@@ -47,6 +55,10 @@ final class AppUser {
   final String userId;
   final String account;
   final String nickname;
+  final String avatarUrl;
+  final String signature;
+  final String imShortNo;
+  final String mobile;
 }
 
 final class AppSession {
@@ -153,6 +165,12 @@ String _stringValue(Object? value, String field) {
   if ((value is! String && value is! num) || value.toString().trim().isEmpty) {
     throw FormatException('$field 格式无效');
   }
+  return value.toString().trim();
+}
+
+String _optionalStringValue(Object? value) {
+  if (value == null) return '';
+  if (value is! String && value is! num) return '';
   return value.toString().trim();
 }
 
