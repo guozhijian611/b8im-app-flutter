@@ -68,7 +68,7 @@ B8IM_APP_PEER_ACCOUNT=<同机构好友测试账号> \
 B8IM_APP_PEER_PASSWORD=<同机构好友测试密码> \
 B8IM_APP_CROSS_ORG_USER_ID=<另一机构用户 user_id> \
 B8IM_APP_OS=ios \
-dart run tool/online_session_smoke.dart
+flutter test tool/online_session_smoke_test.dart --reporter expanded
 ```
 
 该脚本强制使用 `api.idev.love` 与 `ws.idev.love`，并且必须同时完成发送端和收件端 App access token 校验、`file_media` Android/iOS 模块投影、`AUTH_ACK`、`SYNC_ACK`、主动重连及游标恢复、文本 `SEND_ACK`、收件端实时 `PUSH`、发送端 `delivered/read` 回执、`conversation_read`、HTTP 会话/历史回读、跨 organization 发送拒绝、图片与文件上传/预检/WSS 发送/PUSH/私有 URL 解析/下载字节校验才会成功退出。脚本只使用公网测试地址和真实测试对象存储，不接受 mock。

@@ -70,6 +70,7 @@ final class AppApiClient {
     required String mimeType,
     String fileField = 'file',
     Map<String, String> fields = const {},
+    Duration? requestTimeout,
   }) async {
     if (!path.startsWith('/') || path.startsWith('//')) {
       throw const FormatException('API 路径必须是站内绝对路径');
@@ -95,8 +96,13 @@ final class AppApiClient {
       );
     late http.Response response;
     try {
-      final streamed = await _httpClient.send(request).timeout(timeout);
-      response = await http.Response.fromStream(streamed).timeout(timeout);
+      final effectiveTimeout = requestTimeout ?? timeout;
+      final streamed = await _httpClient
+          .send(request)
+          .timeout(effectiveTimeout);
+      response = await http.Response.fromStream(
+        streamed,
+      ).timeout(effectiveTimeout);
     } on TimeoutException {
       throw const AppApiException('请求超时，请检查目标服务');
     }

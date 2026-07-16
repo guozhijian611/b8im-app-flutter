@@ -1,11 +1,11 @@
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
-import 'package:path_provider/path_provider.dart';
 
 import '../discovery/tenant_config.dart';
 import '../network/app_api_client.dart';
 import '../session/app_session.dart';
+import 'app_documents_directory.dart';
 
 enum AppMediaKind {
   image(messageType: 2, wireName: 'image'),
@@ -90,15 +90,16 @@ final class AppMediaService implements AppMediaGateway {
     this._api, {
     http.Client? downloadClient,
     Future<Directory> Function()? documentsDirectory,
+    this.uploadTimeout = const Duration(minutes: 10),
   }) : _downloadClient = downloadClient ?? http.Client(),
        _ownsDownloadClient = downloadClient == null,
-       _documentsDirectory =
-           documentsDirectory ?? getApplicationDocumentsDirectory;
+       _documentsDirectory = documentsDirectory ?? defaultAppDocumentsDirectory;
 
   final AppApiClient _api;
   final http.Client _downloadClient;
   final bool _ownsDownloadClient;
   final Future<Directory> Function() _documentsDirectory;
+  final Duration uploadTimeout;
   final Map<String, _ResolvedAsset> _resolved = {};
 
   @override
@@ -144,6 +145,7 @@ final class AppMediaService implements AppMediaGateway {
         filename: filename,
         mimeType: mimeType,
         fields: {'kind': kind.wireName},
+        requestTimeout: uploadTimeout,
       ),
     );
     if (upload.kind != kind || upload.name != filename || upload.size != size) {
