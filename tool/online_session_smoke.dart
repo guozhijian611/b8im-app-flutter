@@ -23,6 +23,8 @@ Future<void> main() async {
   final peerUserId = environment['B8IM_APP_PEER_USER_ID']?.trim() ?? '';
   final peerAccount = environment['B8IM_APP_PEER_ACCOUNT']?.trim() ?? '';
   final peerPassword = environment['B8IM_APP_PEER_PASSWORD'] ?? '';
+  final crossOrganizationUserId =
+      environment['B8IM_APP_CROSS_ORG_USER_ID']?.trim() ?? '';
   final os = environment['B8IM_APP_OS']?.trim() ?? 'ios';
   final discoveryBaseUrl =
       environment['B8IM_DISCOVERY_BASE_URL']?.trim() ?? 'https://api.idev.love';
@@ -32,11 +34,13 @@ Future<void> main() async {
       password.isEmpty ||
       peerUserId.isEmpty ||
       peerAccount.isEmpty ||
-      peerPassword.isEmpty) {
+      peerPassword.isEmpty ||
+      crossOrganizationUserId.isEmpty) {
     stderr.writeln(
       '需要 B8IM_ENTERPRISE_CODE、B8IM_ROUTING_PUBLIC_KEYS、'
       'B8IM_APP_ACCOUNT、B8IM_APP_PASSWORD、B8IM_APP_PEER_USER_ID、'
-      'B8IM_APP_PEER_ACCOUNT 和 B8IM_APP_PEER_PASSWORD 环境变量',
+      'B8IM_APP_PEER_ACCOUNT、B8IM_APP_PEER_PASSWORD 和 '
+      'B8IM_APP_CROSS_ORG_USER_ID 环境变量',
     );
     exitCode = 64;
     return;
@@ -171,6 +175,20 @@ Future<void> main() async {
       peerUserId,
       sent.messageSeq,
     );
+    String crossOrganizationErrorCode;
+    try {
+      await connection.sendText(
+        conversationType: 1,
+        toUserId: crossOrganizationUserId,
+        text: 'cross-org-rejection-${DateTime.now().millisecondsSinceEpoch}',
+      );
+      throw StateError('跨 organization 用户发送未被 IM 拒绝');
+    } on AppImConnectionException catch (error) {
+      crossOrganizationErrorCode = error.code ?? '';
+      if (crossOrganizationErrorCode != 'SEND_SINGLE_RECEIVER_INVALID') {
+        rethrow;
+      }
+    }
     final messaging = AppMessagingService(api);
     final conversations = await messaging.fetchConversations(
       tenant: tenant,
@@ -236,6 +254,8 @@ Future<void> main() async {
         'read_receipt_status': readReceipt.status.name,
         'conversation_read_seq': conversationRead.lastReadSeq,
         'receipt_recovery_verified': true,
+        'cross_organization_error_code': crossOrganizationErrorCode,
+        'cross_organization_rejected': true,
         'http_history_verified': true,
         'http_delivery_status': historyMessage.deliveryStatus?.name,
         'mark_read_completed': true,

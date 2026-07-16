@@ -657,7 +657,7 @@ final class AppImConnection implements AppImRuntime {
     final message = rawMessage is String && rawMessage.trim().isNotEmpty
         ? rawMessage.trim()
         : 'IM 请求失败';
-    return AppImConnectionException('$code: $message');
+    return AppImConnectionException('$code: $message', code: code);
   }
 
   void _handleSocketError(Object error, StackTrace stackTrace) {
@@ -957,9 +957,10 @@ final class _GlobalSyncResult {
 }
 
 final class AppImConnectionException implements Exception {
-  const AppImConnectionException(this.message);
+  const AppImConnectionException(this.message, {this.code});
 
   final String message;
+  final String? code;
 
   @override
   String toString() => message;
