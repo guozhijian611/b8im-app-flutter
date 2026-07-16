@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 
 import '../discovery/tenant_config.dart';
 import '../im/app_im_connection.dart';
+import '../media/app_media_picker.dart';
+import '../media/app_media_service.dart';
 import '../session/app_session.dart';
 import 'app_im_models.dart';
 import 'app_messaging_service.dart';
@@ -15,12 +17,18 @@ final class MessagingHomePage extends StatefulWidget {
     required this.session,
     required this.im,
     required this.messaging,
+    required this.media,
+    required this.mediaPicker,
+    this.beforeMediaUpload,
   });
 
   final TenantConfig tenant;
   final AppSession session;
   final AppImRuntime im;
   final AppMessagingGateway messaging;
+  final AppMediaGateway media;
+  final AppMediaPickerGateway mediaPicker;
+  final Future<void> Function(int size)? beforeMediaUpload;
 
   @override
   State<MessagingHomePage> createState() => _MessagingHomePageState();
@@ -94,6 +102,9 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
           session: widget.session,
           im: widget.im,
           messaging: widget.messaging,
+          media: widget.media,
+          mediaPicker: widget.mediaPicker,
+          beforeMediaUpload: widget.beforeMediaUpload,
           conversation: conversation,
         ),
       ),
@@ -219,6 +230,9 @@ final class ConversationPage extends StatefulWidget {
     required this.im,
     required this.messaging,
     required this.conversation,
+    required this.media,
+    required this.mediaPicker,
+    this.beforeMediaUpload,
   });
 
   final TenantConfig tenant;
@@ -226,6 +240,9 @@ final class ConversationPage extends StatefulWidget {
   final AppImRuntime im;
   final AppMessagingGateway messaging;
   final AppImConversation conversation;
+  final AppMediaGateway media;
+  final AppMediaPickerGateway mediaPicker;
+  final Future<void> Function(int size)? beforeMediaUpload;
 
   @override
   State<ConversationPage> createState() => _ConversationPageState();
@@ -404,6 +421,67 @@ final class _ConversationPageState extends State<ConversationPage> {
     }
   }
 
+  Future<void> _sendMedia(AppMediaKind kind) async {
+    if (_sending) return;
+    final picked = await widget.mediaPicker.pick(kind);
+    if (picked == null || !mounted) return;
+    setState(() {
+      _sending = true;
+      _error = null;
+    });
+    try {
+      await widget.beforeMediaUpload?.call(picked.size);
+      final uploaded = await widget.media.upload(
+        tenant: widget.tenant,
+        session: widget.session,
+        kind: kind,
+        filePath: picked.path,
+        filename: picked.filename,
+        size: picked.size,
+        mimeType: picked.mimeType,
+      );
+      final message = await widget.im.sendAsset(
+        conversationType: widget.conversation.conversationType,
+        conversationId: widget.conversation.conversationId,
+        toUserId: widget.conversation.peerUser?.userId,
+        messageType: kind.messageType,
+        fileId: uploaded.fileId,
+      );
+      _merge([message]);
+      _scrollToBottom();
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  Future<void> _showAttachmentPicker() async {
+    final kind = await showModalBottomSheet<AppMediaKind>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              key: const ValueKey('pick-image'),
+              leading: const Icon(Icons.image_outlined),
+              title: const Text('发送图片'),
+              onTap: () => Navigator.pop(context, AppMediaKind.image),
+            ),
+            ListTile(
+              key: const ValueKey('pick-file'),
+              leading: const Icon(Icons.attach_file_rounded),
+              title: const Text('发送文件'),
+              onTap: () => Navigator.pop(context, AppMediaKind.file),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (kind != null && mounted) await _sendMedia(kind);
+  }
+
   Future<void> _reconnect() async {
     try {
       await widget.im.reconnect();
@@ -512,6 +590,9 @@ final class _ConversationPageState extends State<ConversationPage> {
                           outgoing:
                               message.senderId == widget.session.user.userId,
                           deliveryStatus: _deliveryStatuses[message.messageId],
+                          tenant: widget.tenant,
+                          session: widget.session,
+                          media: widget.media,
                         );
                       },
                     ),
@@ -521,6 +602,17 @@ final class _ConversationPageState extends State<ConversationPage> {
               padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
               child: Row(
                 children: [
+                  IconButton(
+                    key: const ValueKey('attach-media'),
+                    onPressed:
+                        _sending ||
+                            _connectionStatus != AppImConnectionStatus.connected
+                        ? null
+                        : _showAttachmentPicker,
+                    icon: const Icon(Icons.add_circle_outline_rounded),
+                    tooltip: '图片或文件',
+                  ),
+                  const SizedBox(width: 4),
                   Expanded(
                     child: TextField(
                       key: const ValueKey('message-composer'),
@@ -566,11 +658,17 @@ final class _MessageBubble extends StatelessWidget {
     required this.message,
     required this.outgoing,
     required this.deliveryStatus,
+    required this.tenant,
+    required this.session,
+    required this.media,
   });
 
   final AppImMessage message;
   final bool outgoing;
   final AppImDeliveryStatus? deliveryStatus;
+  final TenantConfig tenant;
+  final AppSession session;
+  final AppMediaGateway media;
 
   @override
   Widget build(BuildContext context) {
@@ -597,7 +695,15 @@ final class _MessageBubble extends StatelessWidget {
                   style: Theme.of(context).textTheme.labelSmall,
                 ),
               ),
-            Text(message.displayText),
+            if (message.messageType == 2 || message.messageType == 3)
+              _AssetMessageContent(
+                message: message,
+                tenant: tenant,
+                session: session,
+                media: media,
+              )
+            else
+              Text(message.displayText),
             const SizedBox(height: 3),
             Text(
               _shortTime(message.createTime),
@@ -612,6 +718,157 @@ final class _MessageBubble extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+final class _AssetMessageContent extends StatefulWidget {
+  const _AssetMessageContent({
+    required this.message,
+    required this.tenant,
+    required this.session,
+    required this.media,
+  });
+
+  final AppImMessage message;
+  final TenantConfig tenant;
+  final AppSession session;
+  final AppMediaGateway media;
+
+  @override
+  State<_AssetMessageContent> createState() => _AssetMessageContentState();
+}
+
+final class _AssetMessageContentState extends State<_AssetMessageContent> {
+  Future<Uri>? _imageUrl;
+  bool _downloading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.message.messageType == 2) _imageUrl = _resolve();
+  }
+
+  Future<Uri> _resolve() => widget.media.resolve(
+    tenant: widget.tenant,
+    session: widget.session,
+    fileId: widget.message.assetFileId,
+    conversationId: widget.message.conversationId,
+    messageId: widget.message.messageId,
+  );
+
+  Future<void> _download() async {
+    if (_downloading) return;
+    setState(() => _downloading = true);
+    try {
+      final path = await widget.media.download(
+        tenant: widget.tenant,
+        session: widget.session,
+        fileId: widget.message.assetFileId,
+        conversationId: widget.message.conversationId,
+        messageId: widget.message.messageId,
+        filename: widget.message.assetName,
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('已下载到 $path')));
+      }
+    } on Object catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('下载失败：$error')));
+      }
+    } finally {
+      if (mounted) setState(() => _downloading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.message.messageType == 2) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          FutureBuilder<Uri>(
+            future: _imageUrl,
+            builder: (context, snapshot) {
+              if (snapshot.hasError) {
+                return TextButton.icon(
+                  onPressed: () => setState(() => _imageUrl = _resolve()),
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('图片加载失败，重试'),
+                );
+              }
+              if (!snapshot.hasData) {
+                return const SizedBox.square(
+                  dimension: 42,
+                  child: CircularProgressIndicator(),
+                );
+              }
+              return ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: Image.network(
+                  snapshot.data.toString(),
+                  width: 220,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, _, _) => const SizedBox(
+                    width: 220,
+                    height: 100,
+                    child: Center(child: Icon(Icons.broken_image_outlined)),
+                  ),
+                ),
+              );
+            },
+          ),
+          IconButton(
+            key: ValueKey('download-${widget.message.messageId}'),
+            onPressed: _downloading ? null : _download,
+            icon: _downloading
+                ? const SizedBox.square(
+                    dimension: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.download_outlined),
+            tooltip: '下载图片',
+          ),
+        ],
+      );
+    }
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const Icon(Icons.insert_drive_file_outlined),
+        const SizedBox(width: 8),
+        Flexible(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                widget.message.assetName,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              Text(
+                _formatBytes(widget.message.assetSize),
+                style: Theme.of(context).textTheme.labelSmall,
+              ),
+            ],
+          ),
+        ),
+        IconButton(
+          key: ValueKey('download-${widget.message.messageId}'),
+          onPressed: _downloading ? null : _download,
+          icon: _downloading
+              ? const SizedBox.square(
+                  dimension: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.download_outlined),
+          tooltip: '下载文件',
+        ),
+      ],
     );
   }
 }
@@ -677,6 +934,18 @@ final class _MessagingError extends StatelessWidget {
 String _initial(String value) {
   final normalized = value.trim();
   return normalized.isEmpty ? '?' : normalized.characters.first;
+}
+
+String _formatBytes(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  var value = bytes.toDouble();
+  var unit = -1;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return '${value.toStringAsFixed(value >= 10 ? 1 : 2)} ${units[unit]}';
 }
 
 String _shortTime(String value) {

@@ -8,11 +8,13 @@ import 'package:b8im_app_flutter/src/im/app_im_connection.dart';
 import 'package:b8im_app_flutter/src/im/im_socket.dart';
 import 'package:b8im_app_flutter/src/messaging/app_im_models.dart';
 import 'package:b8im_app_flutter/src/messaging/app_messaging_service.dart';
+import 'package:b8im_app_flutter/src/media/app_media_service.dart';
 import 'package:b8im_app_flutter/src/network/app_api_client.dart';
 import 'package:b8im_app_flutter/src/security/routing_signature_verifier.dart';
 import 'package:b8im_app_flutter/src/session/app_session.dart';
 import 'package:b8im_app_flutter/src/session/app_session_service.dart';
 import 'package:b8im_app_flutter/src/storage/im_sync_cursor_gateway.dart';
+import 'package:b8im_file_media_module/b8im_file_media_module.dart';
 
 Future<void> main() async {
   final environment = Platform.environment;
@@ -68,6 +70,9 @@ Future<void> main() async {
   AppImRuntime? connection;
   AppImRuntime? peerConnection;
   StreamSubscription<AppImEvent>? senderEventSubscription;
+  Directory? mediaTemp;
+  AppMediaService? mediaService;
+  FileMediaModuleClient? fileMediaModuleClient;
   final senderReceipts = <AppImReceipt>[];
   final senderConversationReads = <AppImConversationReadState>[];
   try {
@@ -98,6 +103,7 @@ Future<void> main() async {
       tenant.organization,
       tenant.deploymentId,
     );
+    _assertFileMediaProjection(clientConfig);
     connection = await AppImConnector(
       sessionService: service,
       cursorStore: _MemoryCursorStore(),
@@ -215,6 +221,136 @@ Future<void> main() async {
     if (historyMessage.deliveryStatus != AppImDeliveryStatus.read) {
       throw StateError('App HTTP 历史未恢复持久化 read 回执状态');
     }
+
+    mediaTemp = await Directory.systemTemp.createTemp('b8im-app-media-smoke-');
+    final imageBytes = base64Decode(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    );
+    final imageFile = File('${mediaTemp.path}/app-smoke.png');
+    final documentFile = File('${mediaTemp.path}/app-smoke.txt');
+    await imageFile.writeAsBytes(imageBytes, flush: true);
+    final documentBytes = utf8.encode(
+      'b8im app media smoke ${DateTime.now().toIso8601String()}',
+    );
+    await documentFile.writeAsBytes(documentBytes, flush: true);
+    fileMediaModuleClient = FileMediaModuleClient(
+      apiBaseUri: apiUri,
+      organization: tenant.organization,
+      accessToken: session.accessToken,
+    );
+    for (final size in [imageBytes.length, documentBytes.length]) {
+      final check = await fileMediaModuleClient.checkUpload(size);
+      if (!check.allowed) {
+        throw StateError('file_media 上传预检拒绝测试附件: ${check.reason}');
+      }
+    }
+    mediaService = AppMediaService(
+      api,
+      documentsDirectory: () async => mediaTemp!,
+    );
+    final imageUpload = await mediaService.upload(
+      tenant: tenant,
+      session: session,
+      kind: AppMediaKind.image,
+      filePath: imageFile.path,
+      filename: 'app-smoke.png',
+      size: imageBytes.length,
+      mimeType: 'image/png',
+    );
+    final imagePushFuture = peerConnection.events
+        .firstWhere(
+          (event) =>
+              event.command == 'push' &&
+              event.message?.messageType == AppMediaKind.image.messageType &&
+              event.message?.assetFileId == imageUpload.fileId,
+        )
+        .timeout(const Duration(seconds: 12));
+    final sentImage = await connection.sendAsset(
+      conversationType: 1,
+      toUserId: peerUserId,
+      messageType: AppMediaKind.image.messageType,
+      fileId: imageUpload.fileId,
+    );
+    final pushedImage = (await imagePushFuture).message;
+    if (pushedImage == null ||
+        pushedImage.messageId != sentImage.messageId ||
+        pushedImage.content?.containsKey('url') == true) {
+      throw StateError('图片 PUSH 未保持 file_id 私有附件契约');
+    }
+    final downloadedImagePath = await mediaService.download(
+      tenant: tenant,
+      session: peerSession,
+      fileId: pushedImage.assetFileId,
+      conversationId: pushedImage.conversationId,
+      messageId: pushedImage.messageId,
+      filename: pushedImage.assetName,
+    );
+    if (!_bytesEqual(
+      await File(downloadedImagePath).readAsBytes(),
+      imageBytes,
+    )) {
+      throw StateError('收件端下载图片与上传源文件不一致');
+    }
+
+    final fileUpload = await mediaService.upload(
+      tenant: tenant,
+      session: session,
+      kind: AppMediaKind.file,
+      filePath: documentFile.path,
+      filename: 'app-smoke.txt',
+      size: documentBytes.length,
+      mimeType: 'text/plain',
+    );
+    final filePushFuture = peerConnection.events
+        .firstWhere(
+          (event) =>
+              event.command == 'push' &&
+              event.message?.messageType == AppMediaKind.file.messageType &&
+              event.message?.assetFileId == fileUpload.fileId,
+        )
+        .timeout(const Duration(seconds: 12));
+    final sentFile = await connection.sendAsset(
+      conversationType: 1,
+      toUserId: peerUserId,
+      messageType: AppMediaKind.file.messageType,
+      fileId: fileUpload.fileId,
+    );
+    final pushedFile = (await filePushFuture).message;
+    if (pushedFile == null ||
+        pushedFile.messageId != sentFile.messageId ||
+        pushedFile.content?.containsKey('url') == true) {
+      throw StateError('文件 PUSH 未保持 file_id 私有附件契约');
+    }
+    final downloadedFilePath = await mediaService.download(
+      tenant: tenant,
+      session: peerSession,
+      fileId: pushedFile.assetFileId,
+      conversationId: pushedFile.conversationId,
+      messageId: pushedFile.messageId,
+      filename: pushedFile.assetName,
+    );
+    if (!_bytesEqual(
+      await File(downloadedFilePath).readAsBytes(),
+      documentBytes,
+    )) {
+      throw StateError('收件端下载文件与上传源文件不一致');
+    }
+    final mediaHistory = await messaging.fetchMessages(
+      tenant: tenant,
+      session: peerSession,
+      conversationId: sent.conversationId,
+      limit: 100,
+    );
+    final mediaHistoryIds = mediaHistory.messages
+        .where((message) => const {2, 3}.contains(message.messageType))
+        .map((message) => message.messageId)
+        .toSet();
+    if (!mediaHistoryIds.containsAll([
+      sentImage.messageId,
+      sentFile.messageId,
+    ])) {
+      throw StateError('图片/文件未出现在收件端 App HTTP 历史分页');
+    }
     await messaging.markRead(
       tenant: tenant,
       session: session,
@@ -259,15 +395,56 @@ Future<void> main() async {
         'http_history_verified': true,
         'http_delivery_status': historyMessage.deliveryStatus?.name,
         'mark_read_completed': true,
+        'file_media_projection_verified': true,
+        'file_media_preflight_verified': true,
+        'image_message_id': sentImage.messageId,
+        'image_file_id': sentImage.assetFileId,
+        'image_upload_push_download_verified': true,
+        'file_message_id': sentFile.messageId,
+        'file_file_id': sentFile.assetFileId,
+        'file_upload_push_download_verified': true,
+        'media_http_history_verified': true,
       }),
     );
   } finally {
+    fileMediaModuleClient?.close();
+    mediaService?.close();
+    if (mediaTemp != null && await mediaTemp.exists()) {
+      await mediaTemp.delete(recursive: true);
+    }
     await senderEventSubscription?.cancel();
     await peerConnection?.close();
     await connection?.close();
     api.close();
     discovery.close();
   }
+}
+
+void _assertFileMediaProjection(Object? value) {
+  final config = value as Map;
+  final modules = config['modules'] as List;
+  final module = modules.whereType<Map>().where(
+    (item) => item['module_key'] == 'file_media',
+  );
+  if (module.length != 1) {
+    throw StateError('App 客户端配置未投影 file_media 模块');
+  }
+  final projection = module.single;
+  final capabilities = (projection['capabilities'] as List).toSet();
+  final permissions = (projection['permissions'] as List).toSet();
+  if (projection['available'] != true ||
+      !capabilities.contains('file_media.app.page') ||
+      !permissions.contains('saimulti:app:file_media:use')) {
+    throw StateError('file_media App capability/permission 投影不完整');
+  }
+}
+
+bool _bytesEqual(List<int> left, List<int> right) {
+  if (left.length != right.length) return false;
+  for (var index = 0; index < left.length; index++) {
+    if (left[index] != right[index]) return false;
+  }
+  return true;
 }
 
 Future<AppImReceipt> _waitForReceipt(

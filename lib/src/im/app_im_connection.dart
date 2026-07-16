@@ -62,6 +62,14 @@ abstract interface class AppImRuntime {
     String? toUserId,
   });
 
+  Future<AppImMessage> sendAsset({
+    required int conversationType,
+    required int messageType,
+    required String fileId,
+    String? conversationId,
+    String? toUserId,
+  });
+
   Future<AppImReceipt> acknowledge({
     required String messageId,
     required AppImDeliveryStatus status,
@@ -345,10 +353,51 @@ final class AppImConnection implements AppImRuntime {
     if (normalized.isEmpty || normalized.length > 4000) {
       throw const FormatException('文本消息长度必须为 1..4000');
     }
+    return _sendMessage(
+      conversationType: conversationType,
+      messageType: 1,
+      content: {'text': normalized},
+      conversationId: conversationId,
+      toUserId: toUserId,
+    );
+  }
+
+  @override
+  Future<AppImMessage> sendAsset({
+    required int conversationType,
+    required int messageType,
+    required String fileId,
+    String? conversationId,
+    String? toUserId,
+  }) {
+    final normalized = fileId.trim();
+    if (!const {2, 3}.contains(messageType) ||
+        !RegExp(r'^[a-f0-9]{40}$').hasMatch(normalized)) {
+      throw const FormatException('App 附件消息类型或 file_id 无效');
+    }
+    return _sendMessage(
+      conversationType: conversationType,
+      messageType: messageType,
+      content: {'file_id': normalized},
+      conversationId: conversationId,
+      toUserId: toUserId,
+    );
+  }
+
+  Future<AppImMessage> _sendMessage({
+    required int conversationType,
+    required int messageType,
+    required Map<String, Object?> content,
+    String? conversationId,
+    String? toUserId,
+  }) async {
+    if (!isConnected) {
+      throw const AppImConnectionException('IM 连接未就绪');
+    }
     final data = <String, Object?>{
       'conversation_type': conversationType,
-      'message_type': 1,
-      'content': {'text': normalized},
+      'message_type': messageType,
+      'content': content,
     };
     if (conversationType == 1) {
       final peer = toUserId?.trim() ?? '';
@@ -388,7 +437,8 @@ final class AppImConnection implements AppImRuntime {
     ).copyWith(deliveryStatus: AppImDeliveryStatus.sent);
     if (message.organization != tenant.organization ||
         message.senderId != session.user.userId ||
-        message.clientMsgId != clientMsgId) {
+        message.clientMsgId != clientMsgId ||
+        message.messageType != messageType) {
       throw const AppImConnectionException('SEND_ACK 与发送请求不一致');
     }
     _events.add(
@@ -869,6 +919,23 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
     return _requireActive().sendText(
       conversationType: conversationType,
       text: text,
+      conversationId: conversationId,
+      toUserId: toUserId,
+    );
+  }
+
+  @override
+  Future<AppImMessage> sendAsset({
+    required int conversationType,
+    required int messageType,
+    required String fileId,
+    String? conversationId,
+    String? toUserId,
+  }) {
+    return _requireActive().sendAsset(
+      conversationType: conversationType,
+      messageType: messageType,
+      fileId: fileId,
       conversationId: conversationId,
       toUserId: toUserId,
     );

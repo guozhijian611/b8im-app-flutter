@@ -310,6 +310,7 @@ final class AppImMessage {
     if ((type != 1 && type != 2) || sequence <= 0 || messageType <= 0) {
       throw const FormatException('消息类型或序号无效');
     }
+    _validateMessageContent(messageType, status, content);
     final rawSender = map['sender_user'];
     return AppImMessage(
       organization: organization,
@@ -392,10 +393,23 @@ final class AppImMessage {
   String get displayText {
     if (status == 'recalled') return '消息已撤回';
     if (status == 'deleted_both') return '消息已删除';
+    if (messageType == 2) return '[图片]';
+    if (messageType == 3) return content?['name']?.toString() ?? '[文件]';
+    if (messageType == 4) return '[语音]';
+    if (messageType == 11) return '[视频]';
     if (messageType != 1) return '[暂不支持的消息类型]';
     final text = content?['text'];
     return text is String && text.isNotEmpty ? text : '[空文本]';
   }
+
+  String get assetFileId => content?['file_id']?.toString() ?? '';
+  String get assetName => content?['name']?.toString() ?? '';
+  int get assetSize {
+    final value = content?['size'];
+    return value is int ? value : 0;
+  }
+
+  String get assetMimeType => content?['mime_type']?.toString() ?? '';
 }
 
 final class AppImMessagePage {
@@ -480,4 +494,36 @@ bool imBool(
 Map<String, Object?>? _content(Object? value, String status, String field) {
   if (status != 'normal') return null;
   return imMap(value, '$field.content');
+}
+
+void _validateMessageContent(
+  int messageType,
+  String status,
+  Map<String, Object?>? content,
+) {
+  if (status != 'normal') return;
+  if (messageType == 1) {
+    final text = content?['text'];
+    if (text is! String || text.trim().isEmpty) {
+      throw const FormatException('文本消息内容无效');
+    }
+    return;
+  }
+  if (!const {2, 3, 4, 11}.contains(messageType)) return;
+  final fileId = content?['file_id'];
+  final name = content?['name'];
+  final size = content?['size'];
+  final mimeType = content?['mime_type'];
+  final extension = content?['extension'];
+  if (fileId is! String ||
+      !RegExp(r'^[a-f0-9]{40}$').hasMatch(fileId) ||
+      name is! String ||
+      name.trim().isEmpty ||
+      size is! int ||
+      size <= 0 ||
+      mimeType is! String ||
+      extension is! String ||
+      extension.trim().isEmpty) {
+    throw const FormatException('附件消息内容无效');
+  }
 }

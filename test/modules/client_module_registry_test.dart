@@ -10,7 +10,7 @@ void main() {
     title: '公告',
     capability: 'announcement.app.page',
     permission: 'saimulti:app:announcement:index',
-    builder: (_, _) => const SizedBox.shrink(),
+    builder: (_, _, _) => const SizedBox.shrink(),
   );
 
   test('只解析 App 已内置且服务端授权的模块', () {

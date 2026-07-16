@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 
 import '../discovery/tenant_config.dart';
 import '../observability/trace_context.dart';
@@ -57,6 +58,52 @@ final class AppApiClient {
       throw const AppApiException('请求超时，请检查目标服务');
     }
 
+    return _responseData(response);
+  }
+
+  Future<Object?> multipart(
+    TenantConfig tenant,
+    String path, {
+    required String accessToken,
+    required String filePath,
+    required String filename,
+    required String mimeType,
+    String fileField = 'file',
+    Map<String, String> fields = const {},
+  }) async {
+    if (!path.startsWith('/') || path.startsWith('//')) {
+      throw const FormatException('API 路径必须是站内绝对路径');
+    }
+    final uri = tenant.routing.primary.endpoints.apiServerUri.resolve(path);
+    final trace = TraceContext.root();
+    final request = http.MultipartRequest('POST', uri)
+      ..headers.addAll(
+        trace.injectHttp({
+          'Accept': 'application/json',
+          'App-Id': tenant.organization.toString(),
+          'Authorization': 'Bearer ${accessToken.trim()}',
+        }),
+      )
+      ..fields.addAll(fields)
+      ..files.add(
+        await http.MultipartFile.fromPath(
+          fileField,
+          filePath,
+          filename: filename,
+          contentType: MediaType.parse(mimeType),
+        ),
+      );
+    late http.Response response;
+    try {
+      final streamed = await _httpClient.send(request).timeout(timeout);
+      response = await http.Response.fromStream(streamed).timeout(timeout);
+    } on TimeoutException {
+      throw const AppApiException('请求超时，请检查目标服务');
+    }
+    return _responseData(response);
+  }
+
+  static Object? _responseData(http.Response response) {
     final payload = _decode(response.body);
     final code = payload['code'];
     if (response.statusCode != 200 || code != 200) {

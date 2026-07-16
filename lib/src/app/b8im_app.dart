@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:b8im_file_media_module/b8im_file_media_module.dart';
 import 'package:flutter/material.dart';
 
 import '../config/app_environment.dart';
@@ -9,6 +10,9 @@ import '../im/app_im_connection.dart';
 import '../im/web_socket_im_socket.dart';
 import '../messaging/app_messaging_service.dart';
 import '../messaging/messaging_home_page.dart';
+import '../media/app_media_picker.dart';
+import '../media/app_media_service.dart';
+import '../modules/app_module_catalog.dart';
 import '../modules/client_module_registry.dart';
 import '../network/app_api_client.dart';
 import '../security/routing_signature_verifier.dart';
@@ -27,6 +31,8 @@ final class B8imApp extends StatefulWidget {
     this.moduleRegistry,
     this.sessionBootstrapGateway,
     this.messagingGateway,
+    this.mediaGateway,
+    this.mediaPicker,
     this.runtime,
   });
 
@@ -36,6 +42,8 @@ final class B8imApp extends StatefulWidget {
   final ClientModuleRegistry? moduleRegistry;
   final AppSessionBootstrapGateway? sessionBootstrapGateway;
   final AppMessagingGateway? messagingGateway;
+  final AppMediaGateway? mediaGateway;
+  final AppMediaPickerGateway? mediaPicker;
   final AppClientRuntime? runtime;
 
   @override
@@ -49,9 +57,12 @@ final class _B8imAppState extends State<B8imApp> {
   late final ClientModuleRegistry _moduleRegistry;
   late final AppSessionBootstrapGateway _sessionBootstrapGateway;
   late final AppMessagingGateway _messagingGateway;
+  late final AppMediaGateway _mediaGateway;
+  late final AppMediaPickerGateway _mediaPicker;
   late final AppClientRuntime _runtime;
   TenantDiscoveryClient? _ownedDiscoveryClient;
   AppApiClient? _ownedApiClient;
+  AppMediaService? _ownedMediaService;
 
   @override
   void initState() {
@@ -71,11 +82,12 @@ final class _B8imAppState extends State<B8imApp> {
     }
     _deviceIdLoader =
         widget.deviceIdLoader ?? DeviceIdentityStore().loadOrCreate;
-    _moduleRegistry = widget.moduleRegistry ?? ClientModuleRegistry(const []);
+    _moduleRegistry = widget.moduleRegistry ?? defaultAppModuleRegistry();
     _runtime = widget.runtime ?? AppClientRuntime.current();
     AppApiClient? apiClient;
     if (widget.sessionBootstrapGateway == null ||
-        widget.messagingGateway == null) {
+        widget.messagingGateway == null ||
+        widget.mediaGateway == null) {
       apiClient = AppApiClient();
       _ownedApiClient = apiClient;
     }
@@ -95,12 +107,21 @@ final class _B8imAppState extends State<B8imApp> {
     }
     _messagingGateway =
         widget.messagingGateway ?? AppMessagingService(apiClient!);
+    if (widget.mediaGateway case final gateway?) {
+      _mediaGateway = gateway;
+    } else {
+      final service = AppMediaService(apiClient!);
+      _ownedMediaService = service;
+      _mediaGateway = service;
+    }
+    _mediaPicker = widget.mediaPicker ?? DeviceAppMediaPicker();
   }
 
   @override
   void dispose() {
     _ownedDiscoveryClient?.close();
     _ownedApiClient?.close();
+    _ownedMediaService?.close();
     super.dispose();
   }
 
@@ -129,6 +150,8 @@ final class _B8imAppState extends State<B8imApp> {
         moduleRegistry: _moduleRegistry,
         sessionBootstrapGateway: _sessionBootstrapGateway,
         messagingGateway: _messagingGateway,
+        mediaGateway: _mediaGateway,
+        mediaPicker: _mediaPicker,
         runtime: _runtime,
       ),
     );
@@ -144,6 +167,8 @@ final class BootstrapPage extends StatefulWidget {
     required this.moduleRegistry,
     required this.sessionBootstrapGateway,
     required this.messagingGateway,
+    required this.mediaGateway,
+    required this.mediaPicker,
     required this.runtime,
   });
 
@@ -153,6 +178,8 @@ final class BootstrapPage extends StatefulWidget {
   final ClientModuleRegistry moduleRegistry;
   final AppSessionBootstrapGateway sessionBootstrapGateway;
   final AppMessagingGateway messagingGateway;
+  final AppMediaGateway mediaGateway;
+  final AppMediaPickerGateway mediaPicker;
   final AppClientRuntime runtime;
 
   @override
@@ -260,16 +287,40 @@ final class _BootstrapPageState extends State<BootstrapPage> {
     final tenant = _tenant;
     final result = _sessionResult;
     if (tenant == null || result == null) return;
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute(
-        builder: (_) => MessagingHomePage(
-          tenant: tenant,
-          session: result.session,
-          im: result.im,
-          messaging: widget.messagingGateway,
-        ),
-      ),
+    final fileMediaEnabled = result.modules.any(
+      (module) => module.registration.moduleKey == 'file_media',
     );
+    final preflightClient = fileMediaEnabled
+        ? FileMediaModuleClient(
+            apiBaseUri: tenant.routing.primary.endpoints.apiServerUri,
+            organization: tenant.organization,
+            accessToken: result.session.accessToken,
+          )
+        : null;
+    try {
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          builder: (_) => MessagingHomePage(
+            tenant: tenant,
+            session: result.session,
+            im: result.im,
+            messaging: widget.messagingGateway,
+            media: widget.mediaGateway,
+            mediaPicker: widget.mediaPicker,
+            beforeMediaUpload: preflightClient == null
+                ? null
+                : (size) async {
+                    final check = await preflightClient.checkUpload(size);
+                    if (!check.allowed) {
+                      throw FileMediaModuleException(check.reason);
+                    }
+                  },
+          ),
+        ),
+      );
+    } finally {
+      preflightClient?.close();
+    }
   }
 
   @override
@@ -358,7 +409,11 @@ final class _BootstrapPageState extends State<BootstrapPage> {
             ],
             if (_sessionResult case final result?) ...[
               const SizedBox(height: 16),
-              _SessionCard(result: result, onOpenMessaging: _openMessaging),
+              _SessionCard(
+                tenant: _tenant!,
+                result: result,
+                onOpenMessaging: _openMessaging,
+              ),
             ],
           ],
         ),
@@ -443,8 +498,13 @@ final class _LoginCard extends StatelessWidget {
 }
 
 final class _SessionCard extends StatelessWidget {
-  const _SessionCard({required this.result, required this.onOpenMessaging});
+  const _SessionCard({
+    required this.tenant,
+    required this.result,
+    required this.onOpenMessaging,
+  });
 
+  final TenantConfig tenant;
   final AppSessionBootstrapResult result;
   final Future<void> Function() onOpenMessaging;
 
@@ -493,6 +553,29 @@ final class _SessionCard extends StatelessWidget {
                 label: const Text('进入消息'),
               ),
             ),
+            for (final module in result.modules) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.tonalIcon(
+                  key: ValueKey('open-module-${module.registration.moduleKey}'),
+                  onPressed: () => Navigator.of(context).push<void>(
+                    MaterialPageRoute(
+                      builder: (context) => module.registration.builder(
+                        context,
+                        module.projection,
+                        ClientModuleContext(
+                          tenant: tenant,
+                          session: result.session,
+                        ),
+                      ),
+                    ),
+                  ),
+                  icon: const Icon(Icons.extension_outlined),
+                  label: Text(module.title),
+                ),
+              ),
+            ],
           ],
         ),
       ),

@@ -18,8 +18,10 @@ b8im Flutter App 仓库，用于按企业码、租户信息和配置中心 JSON 
 - App 专用会话列表、历史消息分页、会话已读接口，以及 Flutter 消息列表与聊天页面。
 - 单元、组件、线上发现及线上 App 会话 smoke 脚本。
 - WSS 断线指数退避重连、持久游标离线恢复、自动送达/已读 ACK、会话已读同步与持久回执状态。
+- 图片与文件选择、App 专用代理上传、WSS `file_id` 消息发送、私有签名 URL 按需解析、图片展示和流式下载。
+- `file_media` Flutter package 固定注册；Android/iOS capability/permission 与租户授权有效时展示配额页，并在媒体上传前执行配额预检。
 
-本阶段尚未实现系统通知推送、图片/文件/语音等富媒体消息和具体商业模块页面；这些能力将在当前消息运行时与模块投影基座上逐个以 Flutter package 接入，不能把注册器本身描述成模块已完成。
+本阶段尚未实现系统通知推送、语音/视频消息和其余商业模块页面；这些能力将在当前消息运行时与模块投影基座上逐个以 Flutter package 接入。
 
 ## 本机开发
 
@@ -69,7 +71,7 @@ B8IM_APP_OS=ios \
 dart run tool/online_session_smoke.dart
 ```
 
-该脚本强制使用 `api.idev.love` 与 `ws.idev.love`，并且必须同时完成发送端和收件端 App access token 校验、客户端配置投影、`AUTH_ACK`、`SYNC_ACK`、主动重连及游标恢复、文本 `SEND_ACK`、收件端实时 `PUSH`、发送端 `delivered/read` 回执、`conversation_read`、HTTP 会话/历史回读、已读写入和跨 organization 发送拒绝才会成功退出。脚本会向指定测试好友写入一条带时间戳的 QA 文本消息。
+该脚本强制使用 `api.idev.love` 与 `ws.idev.love`，并且必须同时完成发送端和收件端 App access token 校验、`file_media` Android/iOS 模块投影、`AUTH_ACK`、`SYNC_ACK`、主动重连及游标恢复、文本 `SEND_ACK`、收件端实时 `PUSH`、发送端 `delivered/read` 回执、`conversation_read`、HTTP 会话/历史回读、跨 organization 发送拒绝、图片与文件上传/预检/WSS 发送/PUSH/私有 URL 解析/下载字节校验才会成功退出。脚本只使用公网测试地址和真实测试对象存储，不接受 mock。
 
 ## App 模块接入
 

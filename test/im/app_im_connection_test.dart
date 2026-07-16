@@ -84,6 +84,15 @@ void main() {
     expect(sent.displayText, 'Flutter message');
     expect(sent.senderId, 'user-01');
     expect(sent.deliveryStatus, AppImDeliveryStatus.sent);
+    final asset = await connection.sendAsset(
+      conversationType: 1,
+      toUserId: 'peer-01',
+      messageType: 2,
+      fileId: _assetFileId,
+    );
+    expect(asset.messageType, 2);
+    expect(asset.assetFileId, _assetFileId);
+    expect(asset.assetName, 'photo.png');
     final receipt = await connection.acknowledge(
       messageId: 'message-04',
       status: AppImDeliveryStatus.read,
@@ -275,6 +284,7 @@ final class _MessagingSocket implements ImSocket {
         final clientMsgId = packet['client_msg_id']! as String;
         final data = packet['data']! as Map<String, Object?>;
         final content = data['content']! as Map<String, Object?>;
+        final messageType = data['message_type']! as int;
         _controller.add(
           jsonEncode({
             'cmd': 'send_ack',
@@ -283,14 +293,24 @@ final class _MessagingSocket implements ImSocket {
             'data': {
               'ok': true,
               'duplicated': false,
-              'message': _message(
-                messageId: 'message-05',
-                clientMsgId: clientMsgId,
-                messageSeq: 5,
-                globalSeq: '5',
-                senderId: 'user-01',
-                text: content['text']! as String,
-              ),
+              'message': messageType == 1
+                  ? _message(
+                      messageId: 'message-05',
+                      clientMsgId: clientMsgId,
+                      messageSeq: 5,
+                      globalSeq: '5',
+                      senderId: 'user-01',
+                      text: content['text']! as String,
+                    )
+                  : _assetMessage(
+                      messageId: 'message-06',
+                      clientMsgId: clientMsgId,
+                      messageSeq: 6,
+                      globalSeq: '6',
+                      senderId: 'user-01',
+                      messageType: messageType,
+                      fileId: content['file_id']! as String,
+                    ),
             },
           }),
         );
@@ -371,6 +391,41 @@ Map<String, Object?> _message({
   'create_time': '2026-07-16 21:00:00',
   'update_time': '2026-07-16 21:00:00',
 };
+
+Map<String, Object?> _assetMessage({
+  required String messageId,
+  required String clientMsgId,
+  required int messageSeq,
+  required String globalSeq,
+  required String senderId,
+  required int messageType,
+  required String fileId,
+}) => {
+  'organization': 1,
+  'global_seq': globalSeq,
+  'conversation_id': 'conversation-01',
+  'conversation_type': 1,
+  'message_id': messageId,
+  'message_seq': messageSeq,
+  'client_msg_id': clientMsgId,
+  'sender_id': senderId,
+  'sender_user': null,
+  'message_type': messageType,
+  'content': {
+    'file_id': fileId,
+    'name': 'photo.png',
+    'size': 4,
+    'mime_type': 'image/png',
+    'extension': 'png',
+  },
+  'status': 'normal',
+  'edit_time': '',
+  'edit_count': 0,
+  'create_time': '2026-07-16 21:00:00',
+  'update_time': '2026-07-16 21:00:00',
+};
+
+const _assetFileId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 
 String _jwt(Map<String, Object?> payload) {
   final header = base64Url

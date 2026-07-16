@@ -7,11 +7,20 @@ environment:
   sdk: ^3.12.2
 
 dependencies:
+  b8im_file_media_module:
+    path: ../b8im-module-file-media/app
   cryptography: ^2.9.0
   cupertino_icons: ^1.0.8
+  file_selector: ^1.1.0
   flutter:
     sdk: flutter
   http: ^1.6.0
+  http_parser: ^4.1.2
+  image_picker: ^1.2.1
+  mime: ^2.0.0
+  path_provider: ^2.1.5
+  # 2.3.x 改用 JNI，当前 Flutter 3.44.6 + Java 21/AGP 9 的 JdkImageTransform 无法构建。
+  path_provider_android: 2.2.23
   shared_preferences: ^2.5.5
   web_socket_channel: ^3.0.3
 

@@ -135,6 +135,15 @@ final class _FakeImRuntime implements AppImRuntime {
   }
 
   @override
+  Future<AppImMessage> sendAsset({
+    required int conversationType,
+    required int messageType,
+    required String fileId,
+    String? conversationId,
+    String? toUserId,
+  }) => throw UnimplementedError();
+
+  @override
   Future<void> close() async {
     closed = true;
     await controller.close();

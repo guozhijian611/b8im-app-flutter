@@ -1,9 +1,21 @@
 import 'package:flutter/widgets.dart';
 
 import '../discovery/tenant_config.dart';
+import '../session/app_session.dart';
 
 typedef ClientModuleBuilder =
-    Widget Function(BuildContext context, ClientModuleProjection projection);
+    Widget Function(
+      BuildContext context,
+      ClientModuleProjection projection,
+      ClientModuleContext moduleContext,
+    );
+
+final class ClientModuleContext {
+  const ClientModuleContext({required this.tenant, required this.session});
+
+  final TenantConfig tenant;
+  final AppSession session;
+}
 
 final class ClientModuleRegistration {
   const ClientModuleRegistration({
