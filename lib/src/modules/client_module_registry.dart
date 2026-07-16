@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/widgets.dart';
 
 import '../discovery/tenant_config.dart';
@@ -108,7 +110,8 @@ final class ClientModuleRegistry {
       }
       final capabilities = _strings(module['capabilities'], 'capabilities');
       final permissions = _strings(module['permissions'], 'permissions');
-      final moduleConfig = _map(module['config'], '$moduleKey.config');
+      // Server may omit config or send null for modules without runtime knobs.
+      final moduleConfig = _optionalMap(module['config'], '$moduleKey.config');
       final moduleVersion = module['version'];
       final available = module['available'];
       if (moduleVersion is! String ||
@@ -188,6 +191,38 @@ final class ClientModuleRegistry {
   static Map<String, Object?> _map(Object? value, String field) {
     if (value is! Map) throw FormatException('$field 格式无效');
     return value.map((key, item) => MapEntry(key.toString(), item));
+  }
+
+  /// Treats null / empty-string / empty-list config as empty object.
+  /// Accepts Map, or a JSON object string; rejects other shapes.
+  static Map<String, Object?> _optionalMap(Object? value, String field) {
+    if (value == null) {
+      return const <String, Object?>{};
+    }
+    if (value is Map) {
+      return value.map((key, item) => MapEntry(key.toString(), item));
+    }
+    if (value is List && value.isEmpty) {
+      return const <String, Object?>{};
+    }
+    if (value is String) {
+      final trimmed = value.trim();
+      if (trimmed.isEmpty || trimmed == '{}' || trimmed == 'null') {
+        return const <String, Object?>{};
+      }
+      try {
+        final decoded = jsonDecode(trimmed);
+        if (decoded == null) {
+          return const <String, Object?>{};
+        }
+        if (decoded is Map) {
+          return decoded.map((key, item) => MapEntry(key.toString(), item));
+        }
+      } on FormatException {
+        throw FormatException('$field 格式无效');
+      }
+    }
+    throw FormatException('$field 格式无效');
   }
 
   static Set<String> _strings(Object? value, String field) {
