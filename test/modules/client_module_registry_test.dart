@@ -48,6 +48,20 @@ void main() {
     builder: (_, _, _) => const SizedBox.shrink(),
   );
 
+  test('默认注册表包含九个正式企业模块', () {
+    expect(defaultAppModuleRegistry().moduleKeys, {
+      'announcement',
+      'customer_service',
+      'favorite',
+      'file_media',
+      'i18n',
+      'moments',
+      'robot_single',
+      'search',
+      'sticker',
+    });
+  });
+
   test('只解析 App 已内置且服务端授权的模块', () {
     final registry = ClientModuleRegistry([announcement]);
     final resolved = registry.resolve(
@@ -191,10 +205,7 @@ void main() {
     final registry = defaultAppModuleRegistry();
     final resolved = registry.resolve(
       tenant: tenantFixture(),
-      payload: _payload(
-        features: {'file_media': true},
-        modules: const [],
-      ),
+      payload: _payload(features: {'file_media': true}, modules: const []),
     );
     expect(resolved, isEmpty);
   });
@@ -240,7 +251,9 @@ void main() {
               'config': config,
             },
           ],
-          'tabbar': <Object?>[],
+          'tabbar': [
+            {'module_key': 'file_media', 'title': '文件媒体'},
+          ],
         },
       );
       expect(resolved, hasLength(1));

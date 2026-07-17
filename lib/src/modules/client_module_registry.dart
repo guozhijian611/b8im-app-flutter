@@ -130,6 +130,7 @@ final class ClientModuleRegistry {
     }
 
     final titles = <String, String>{};
+    final tabbarKeys = <String>{};
     final tabbar = config['tabbar'];
     if (tabbar is! List) {
       throw const FormatException('客户端配置 tabbar 格式无效');
@@ -143,6 +144,9 @@ final class ClientModuleRegistry {
           _registrations.containsKey(moduleKey) &&
           title is String &&
           title.trim().isNotEmpty) {
+        if (!tabbarKeys.add(moduleKey)) {
+          throw FormatException('客户端配置 tabbar 含重复模块: $moduleKey');
+        }
         titles[moduleKey] = title.trim();
       }
     }
@@ -152,7 +156,8 @@ final class ClientModuleRegistry {
       final projection = projections[registration.moduleKey];
       if (projection == null ||
           !projection.available ||
-          features[registration.moduleKey] == false ||
+          features[registration.moduleKey] != true ||
+          !tabbarKeys.contains(registration.moduleKey) ||
           !projection.capabilities.contains(registration.capability) ||
           !projection.permissions.contains(registration.permission)) {
         continue;
