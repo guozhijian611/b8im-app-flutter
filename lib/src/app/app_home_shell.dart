@@ -11,6 +11,8 @@ import '../messaging/app_messaging_service.dart';
 import '../messaging/messaging_home_page.dart';
 import '../modules/client_module_registry.dart';
 import '../profile/profile_page.dart';
+import '../qr_login/app_qr_login_service.dart';
+import '../qr_login/web_login_scanner_page.dart';
 import '../session/app_session.dart';
 import 'app_theme.dart';
 
@@ -25,7 +27,9 @@ final class AppHomeShell extends StatefulWidget {
     required this.contacts,
     required this.media,
     required this.mediaPicker,
+    required this.qrLogin,
     required this.onLogout,
+    this.qrScannerFactory,
     this.beforeMediaUpload,
   });
 
@@ -37,6 +41,8 @@ final class AppHomeShell extends StatefulWidget {
   final AppContactGateway contacts;
   final AppMediaGateway media;
   final AppMediaPickerGateway mediaPicker;
+  final AppQrLoginGateway qrLogin;
+  final AppQrCodeScannerFactory? qrScannerFactory;
   final Future<void> Function() onLogout;
   final Future<void> Function(int size)? beforeMediaUpload;
 
@@ -64,6 +70,8 @@ final class _AppHomeShellState extends State<AppHomeShell> {
         messaging: widget.messaging,
         media: widget.media,
         mediaPicker: widget.mediaPicker,
+        qrLogin: widget.qrLogin,
+        qrScannerFactory: widget.qrScannerFactory,
         beforeMediaUpload: widget.beforeMediaUpload,
         onOpenContacts: () => _select(1),
         onUnreadChanged: (value) {

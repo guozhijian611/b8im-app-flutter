@@ -15,6 +15,8 @@ import '../media/app_media_service.dart';
 import '../modules/app_module_catalog.dart';
 import '../modules/client_module_registry.dart';
 import '../network/app_api_client.dart';
+import '../qr_login/app_qr_login_service.dart';
+import '../qr_login/web_login_scanner_page.dart';
 import '../security/routing_signature_verifier.dart';
 import '../session/app_session.dart';
 import '../session/app_session_bootstrapper.dart';
@@ -36,6 +38,8 @@ final class B8imApp extends StatefulWidget {
     this.contactGateway,
     this.mediaGateway,
     this.mediaPicker,
+    this.qrLoginGateway,
+    this.qrScannerFactory,
     this.runtime,
   });
 
@@ -48,6 +52,8 @@ final class B8imApp extends StatefulWidget {
   final AppContactGateway? contactGateway;
   final AppMediaGateway? mediaGateway;
   final AppMediaPickerGateway? mediaPicker;
+  final AppQrLoginGateway? qrLoginGateway;
+  final AppQrCodeScannerFactory? qrScannerFactory;
   final AppClientRuntime? runtime;
 
   @override
@@ -64,6 +70,7 @@ final class _B8imAppState extends State<B8imApp> {
   late final AppContactGateway _contactGateway;
   late final AppMediaGateway _mediaGateway;
   late final AppMediaPickerGateway _mediaPicker;
+  late final AppQrLoginGateway _qrLoginGateway;
   late final AppClientRuntime _runtime;
   TenantDiscoveryClient? _ownedDiscoveryClient;
   AppApiClient? _ownedApiClient;
@@ -93,7 +100,8 @@ final class _B8imAppState extends State<B8imApp> {
     if (widget.sessionBootstrapGateway == null ||
         widget.messagingGateway == null ||
         widget.contactGateway == null ||
-        widget.mediaGateway == null) {
+        widget.mediaGateway == null ||
+        widget.qrLoginGateway == null) {
       apiClient = AppApiClient();
       _ownedApiClient = apiClient;
     }
@@ -122,6 +130,7 @@ final class _B8imAppState extends State<B8imApp> {
       _mediaGateway = service;
     }
     _mediaPicker = widget.mediaPicker ?? DeviceAppMediaPicker();
+    _qrLoginGateway = widget.qrLoginGateway ?? AppQrLoginService(apiClient!);
   }
 
   @override
@@ -148,6 +157,8 @@ final class _B8imAppState extends State<B8imApp> {
         contactGateway: _contactGateway,
         mediaGateway: _mediaGateway,
         mediaPicker: _mediaPicker,
+        qrLoginGateway: _qrLoginGateway,
+        qrScannerFactory: widget.qrScannerFactory,
         runtime: _runtime,
       ),
     );
@@ -166,6 +177,8 @@ final class BootstrapPage extends StatefulWidget {
     required this.contactGateway,
     required this.mediaGateway,
     required this.mediaPicker,
+    required this.qrLoginGateway,
+    this.qrScannerFactory,
     required this.runtime,
   });
 
@@ -178,6 +191,8 @@ final class BootstrapPage extends StatefulWidget {
   final AppContactGateway contactGateway;
   final AppMediaGateway mediaGateway;
   final AppMediaPickerGateway mediaPicker;
+  final AppQrLoginGateway qrLoginGateway;
+  final AppQrCodeScannerFactory? qrScannerFactory;
   final AppClientRuntime runtime;
 
   @override
@@ -311,6 +326,8 @@ final class _BootstrapPageState extends State<BootstrapPage> {
             contacts: widget.contactGateway,
             media: widget.mediaGateway,
             mediaPicker: widget.mediaPicker,
+            qrLogin: widget.qrLoginGateway,
+            qrScannerFactory: widget.qrScannerFactory,
             beforeMediaUpload: preflightClient == null
                 ? null
                 : (size) async {
