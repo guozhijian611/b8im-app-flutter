@@ -118,6 +118,15 @@ void main() {
       ).senderUserId,
       '界' * 21,
     );
+    for (final userId in ['\u000Cidentity\u000C', '\u00A0identity\u00A0']) {
+      expect(
+        SearchMessageSenderFilter(
+          senderOrganization: 901,
+          senderUserId: userId,
+        ).senderUserId,
+        userId,
+      );
+    }
   });
 
   test('App 消息搜索缺少或伪造 sender_organization 时失败关闭', () async {

@@ -733,7 +733,8 @@ String _canonicalAccessId(Object? value, String field) {
   if (value is! String ||
       value.isEmpty ||
       utf8.encode(value).length > 64 ||
-      value.trim() != value ||
+      value.startsWith(' ') ||
+      value.endsWith(' ') ||
       _invalidAccessIdFragments.any(value.contains)) {
     throw FormatException('$field 格式无效');
   }
