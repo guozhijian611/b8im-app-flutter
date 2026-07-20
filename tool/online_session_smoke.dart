@@ -27,6 +27,11 @@ Future<void> main() async {
   final peerPassword = environment['B8IM_APP_PEER_PASSWORD'] ?? '';
   final crossOrganizationUserId =
       environment['B8IM_APP_CROSS_ORG_USER_ID']?.trim() ?? '';
+  final crossOrganization =
+      int.tryParse(
+        environment['B8IM_APP_CROSS_ORG_ORGANIZATION']?.trim() ?? '',
+      ) ??
+      0;
   final os = environment['B8IM_APP_OS']?.trim() ?? 'ios';
   final discoveryBaseUrl =
       environment['B8IM_DISCOVERY_BASE_URL']?.trim() ?? 'https://api.idev.love';
@@ -37,12 +42,13 @@ Future<void> main() async {
       peerUserId.isEmpty ||
       peerAccount.isEmpty ||
       peerPassword.isEmpty ||
-      crossOrganizationUserId.isEmpty) {
+      crossOrganizationUserId.isEmpty ||
+      crossOrganization <= 0) {
     stderr.writeln(
       '需要 B8IM_ENTERPRISE_CODE、B8IM_ROUTING_PUBLIC_KEYS、'
       'B8IM_APP_ACCOUNT、B8IM_APP_PASSWORD、B8IM_APP_PEER_USER_ID、'
       'B8IM_APP_PEER_ACCOUNT、B8IM_APP_PEER_PASSWORD 和 '
-      'B8IM_APP_CROSS_ORG_USER_ID 环境变量',
+      'B8IM_APP_CROSS_ORG_USER_ID 和 B8IM_APP_CROSS_ORG_ORGANIZATION 环境变量',
     );
     exitCode = 64;
     return;
@@ -110,7 +116,15 @@ Future<void> main() async {
       socketFactory: _CommandLineImSocket.connect,
     ).connect(tenant: tenant, session: session);
     final initialClientId = connection.bootstrap.clientId;
+    await connection.consumeGlobalSync(
+      nextGlobalSeq: connection.bootstrap.nextGlobalSeq,
+      consumer: (_) async {},
+    );
     await connection.reconnect();
+    await connection.consumeGlobalSync(
+      nextGlobalSeq: connection.bootstrap.nextGlobalSeq,
+      consumer: (_) async {},
+    );
     final reconnectedClientId = connection.bootstrap.clientId;
     if (reconnectedClientId == initialClientId || !connection.isConnected) {
       throw StateError('App 主动重连未建立新的 WSS 会话');
@@ -150,6 +164,7 @@ Future<void> main() async {
         .timeout(const Duration(seconds: 12));
     final sent = await connection.sendText(
       conversationType: 1,
+      toOrganization: tenant.organization,
       toUserId: peerUserId,
       text: probeText,
     );
@@ -162,13 +177,22 @@ Future<void> main() async {
       sent.messageId,
       AppImDeliveryStatus.delivered,
     );
+    final peerConversationIdentity = AppImConversationIdentityContext(
+      organization: tenant.organization,
+      userId: peerSession.user.userId,
+      conversationId: sent.conversationId,
+      conversationType: 1,
+      peerOrganization: tenant.organization,
+      peerUserId: session.user.userId,
+    );
     await peerConnection.acknowledge(
-      messageId: sent.messageId,
+      message: pushed.message!,
       status: AppImDeliveryStatus.read,
+      identity: peerConversationIdentity,
     );
     await peerConnection.markConversationRead(
-      conversationId: sent.conversationId,
-      lastReadMessageId: sent.messageId,
+      identity: peerConversationIdentity,
+      lastReadMessage: pushed.message!,
     );
     final readReceipt = await _waitForReceipt(
       senderReceipts,
@@ -185,6 +209,7 @@ Future<void> main() async {
     try {
       await connection.sendText(
         conversationType: 1,
+        toOrganization: crossOrganization,
         toUserId: crossOrganizationUserId,
         text: 'cross-org-rejection-${DateTime.now().millisecondsSinceEpoch}',
       );
@@ -267,6 +292,7 @@ Future<void> main() async {
         .timeout(const Duration(seconds: 12));
     final sentImage = await connection.sendAsset(
       conversationType: 1,
+      toOrganization: tenant.organization,
       toUserId: peerUserId,
       messageType: AppMediaKind.image.messageType,
       fileId: imageUpload.fileId,
@@ -311,6 +337,7 @@ Future<void> main() async {
         .timeout(const Duration(seconds: 12));
     final sentFile = await connection.sendAsset(
       conversationType: 1,
+      toOrganization: tenant.organization,
       toUserId: peerUserId,
       messageType: AppMediaKind.file.messageType,
       fileId: fileUpload.fileId,
@@ -569,13 +596,44 @@ final class _CommandLineImSocket implements ImSocket {
 
 final class _MemoryCursorStore implements ImSyncCursorGateway {
   String _value = '0';
+  String _accessHighWater = '0';
 
   @override
   Future<String> read(int organization, String userId) async => _value;
 
   @override
-  Future<void> write(int organization, String userId, String cursor) async {
+  Future<bool> write(
+    int organization,
+    String userId,
+    String cursor, {
+    bool Function()? isCurrent,
+  }) async {
+    if (isCurrent?.call() == false) return false;
+    if (BigInt.parse(cursor) < BigInt.parse(_value)) {
+      throw StateError('global_seq cursor rollback');
+    }
     _value = cursor;
+    return true;
+  }
+
+  @override
+  Future<String> readAccessSnapshotHighWater(
+    int organization,
+    String userId,
+  ) async => _accessHighWater;
+
+  @override
+  Future<bool> writeAccessSnapshotHighWater(
+    int organization,
+    String userId,
+    String snapshotId, {
+    bool Function()? isCurrent,
+  }) async {
+    if (isCurrent?.call() == false) return false;
+    if (BigInt.parse(snapshotId) > BigInt.parse(_accessHighWater)) {
+      _accessHighWater = snapshotId;
+    }
+    return true;
   }
 }
 

@@ -14,6 +14,18 @@ import '../session/app_session.dart';
 import 'app_contact_models.dart';
 import 'app_contact_service.dart';
 
+String _contactIdentityKey(int organization, String userId) =>
+    '$organization:${userId.trim()}';
+
+String? _friendRequestPeerKey(
+  AppFriendRequest request,
+  int currentOrganization,
+) {
+  if (!request.hasAuthoritativeContext(currentOrganization)) return null;
+  final user = request.displayUser!;
+  return _contactIdentityKey(user.organization, user.userId);
+}
+
 final class ContactsPage extends StatefulWidget {
   const ContactsPage({
     super.key,
@@ -43,9 +55,15 @@ final class ContactsPage extends StatefulWidget {
 final class _ContactsPageState extends State<ContactsPage> {
   final _searchController = TextEditingController();
   List<AppContact> _contacts = const [];
+  List<AppFriendRequest> _requests = const [];
   int _pendingRequests = 0;
   bool _loading = true;
   String? _error;
+  StreamSubscription<AppImEvent>? _eventSubscription;
+  late final AppImAccessEventGate _accessGate;
+  final Set<String> _revokedPeerIdentities = {};
+  final Set<String> _pendingRestorePeerIdentities = {};
+  int _accessEpoch = 0;
 
   List<AppContact> get _filtered {
     final keyword = _searchController.text.trim().toLowerCase();
@@ -65,16 +83,64 @@ final class _ContactsPageState extends State<ContactsPage> {
   @override
   void initState() {
     super.initState();
+    _accessGate = AppImAccessEventGate(
+      widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+    );
+    _accessGate.reconcileConnectionSnapshot(
+      current: widget.im.bootstrap.crossOrgAccessSnapshotId,
+      highestPositive: widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+    );
+    _eventSubscription = widget.im.events.listen(
+      (event) {
+        if (event.accessChanged case final accessChanged?) {
+          _applyAccessChanged(accessChanged);
+        }
+        if (event.connectionStatus == AppImConnectionStatus.connected) {
+          final snapshot = _accessGate.reconcileConnectionSnapshot(
+            current: widget.im.bootstrap.crossOrgAccessSnapshotId,
+            highestPositive:
+                widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+          );
+          if (snapshot == AppImAccessSnapshotObservation.invalid ||
+              snapshot == AppImAccessSnapshotObservation.stale ||
+              _accessGate.isCrossOrganizationFailClosed) {
+            _failCloseCrossOrganization();
+          } else {
+            _accessEpoch += 1;
+            _hideCrossOrganizationData();
+            _revokedPeerIdentities.clear();
+            _pendingRestorePeerIdentities.clear();
+            for (final accessChanged in widget.im.recentAccessChanges) {
+              _applyAccessChanged(accessChanged);
+            }
+            unawaited(_load());
+          }
+        }
+      },
+      onError: (Object error) {
+        if (isAppImAccessSnapshotFailure(error)) {
+          _failCloseCrossOrganization(error: error);
+        }
+      },
+    );
+    for (final accessChanged in widget.im.recentAccessChanges) {
+      _applyAccessChanged(accessChanged);
+    }
+    if (_accessGate.isCrossOrganizationFailClosed) {
+      _failCloseCrossOrganization();
+    }
     unawaited(_load());
   }
 
   @override
   void dispose() {
+    unawaited(_eventSubscription?.cancel());
     _searchController.dispose();
     super.dispose();
   }
 
-  Future<void> _load() async {
+  Future<void> _load({String? restoringPeerKey}) async {
+    final accessEpoch = _accessEpoch;
     if (mounted) {
       setState(() {
         _loading = true;
@@ -94,26 +160,179 @@ final class _ContactsPageState extends State<ContactsPage> {
       ]);
       final contacts = results[0] as List<AppContact>;
       final requests = results[1] as List<AppFriendRequest>;
+      if (accessEpoch != _accessEpoch) return;
+      if (restoringPeerKey != null) {
+        _pendingRestorePeerIdentities.add(restoringPeerKey);
+      }
+      final confirmedRestoreKeys = <String>{
+        for (final contact in contacts)
+          _contactIdentityKey(contact.organization, contact.userId),
+        ...requests
+            .map(
+              (request) =>
+                  _friendRequestPeerKey(request, widget.session.organization),
+            )
+            .whereType<String>(),
+      }.where(_pendingRestorePeerIdentities.contains).toSet();
+      _revokedPeerIdentities.removeAll(confirmedRestoreKeys);
+      _pendingRestorePeerIdentities.removeAll(confirmedRestoreKeys);
+      final visibleContacts = contacts
+          .where(
+            (item) =>
+                (item.organization == widget.session.organization ||
+                    !_accessGate.isCrossOrganizationFailClosed) &&
+                !_revokedPeerIdentities.contains(
+                  _contactIdentityKey(item.organization, item.userId),
+                ),
+          )
+          .toList(growable: false);
+      final visibleRequests = requests
+          .where((item) {
+            final key = _friendRequestPeerKey(
+              item,
+              widget.session.organization,
+            );
+            return key != null &&
+                (item.peerOrganization == widget.session.organization ||
+                    !_accessGate.isCrossOrganizationFailClosed) &&
+                !_revokedPeerIdentities.contains(key);
+          })
+          .toList(growable: false);
       if (mounted) {
         setState(() {
-          _contacts = contacts;
-          _pendingRequests = requests
+          _contacts = visibleContacts;
+          _requests = visibleRequests;
+          _pendingRequests = visibleRequests
               .where((item) => item.isPendingIncoming)
               .length;
         });
       }
     } on Object catch (error) {
-      if (mounted) setState(() => _error = _contactLoadMessage(error));
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _error = _contactLoadMessage(error));
+      }
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  void _applyAccessChanged(AppImConversationAccessChanged accessChanged) {
+    if (!appImSameIdentity(
+          accessChanged.targetOrganization,
+          accessChanged.targetUserId,
+          widget.session.organization,
+          widget.session.user.userId,
+        ) ||
+        _accessGate.observe(accessChanged) != AppImAccessEventDecision.apply) {
+      return;
+    }
+    final key = _contactIdentityKey(
+      accessChanged.peerOrganization,
+      accessChanged.peerUserId,
+    );
+    _accessEpoch += 1;
+    if (accessChanged.allowed) {
+      _pendingRestorePeerIdentities.add(key);
+      _revokedPeerIdentities.add(key);
+      _hidePeerData(key);
+      unawaited(_load(restoringPeerKey: key));
+      return;
+    } else {
+      _pendingRestorePeerIdentities.remove(key);
+      _revokedPeerIdentities.add(key);
+      _hidePeerData(key);
+    }
+    unawaited(_load());
+  }
+
+  void _hidePeerData(String key) {
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _contacts = _contacts
+          .where(
+            (item) =>
+                _contactIdentityKey(item.organization, item.userId) != key,
+          )
+          .toList(growable: false);
+      _requests = _requests
+          .where((item) {
+            final requestKey = _friendRequestPeerKey(
+              item,
+              widget.session.organization,
+            );
+            return requestKey != null && requestKey != key;
+          })
+          .toList(growable: false);
+      _pendingRequests = _requests
+          .where((item) => item.isPendingIncoming)
+          .length;
+    });
+  }
+
+  void _hideCrossOrganizationData() {
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _contacts = _contacts
+          .where((item) => item.organization == widget.session.organization)
+          .toList(growable: false);
+      _requests = _requests
+          .where((item) {
+            return _friendRequestPeerKey(item, widget.session.organization) !=
+                    null &&
+                item.peerOrganization == widget.session.organization;
+          })
+          .toList(growable: false);
+      _pendingRequests = _requests
+          .where((item) => item.isPendingIncoming)
+          .length;
+    });
+  }
+
+  void _failCloseCrossOrganization({Object? error}) {
+    _accessEpoch += 1;
+    _accessGate.resetSnapshot('0');
+    _pendingRestorePeerIdentities.clear();
+    final contacts = _contacts
+        .where((item) => item.organization == widget.session.organization)
+        .toList(growable: false);
+    final requests = _requests
+        .where((item) {
+          return _friendRequestPeerKey(item, widget.session.organization) !=
+                  null &&
+              item.peerOrganization == widget.session.organization;
+        })
+        .toList(growable: false);
+    if (mounted) {
+      setState(() {
+        _loading = false;
+        _contacts = contacts;
+        _requests = requests;
+        _pendingRequests = requests
+            .where((item) => item.isPendingIncoming)
+            .length;
+        if (error != null) _error = error.toString();
+      });
     }
   }
 
   Future<void> _openContact(AppContact contact) async {
+    final accessEpoch = _accessEpoch;
+    final key = _contactIdentityKey(contact.organization, contact.userId);
     await Navigator.of(context).push<void>(
       MaterialPageRoute(
         builder: (_) => ContactProfilePage(
           contact: contact,
+          session: widget.session,
+          im: widget.im,
+          initiallyAvailable:
+              accessEpoch == _accessEpoch &&
+              (contact.organization == widget.session.organization ||
+                  (!_accessGate.isCrossOrganizationFailClosed &&
+                      !_revokedPeerIdentities.contains(key))),
           onMessage: () => _openChat(contact),
         ),
       ),
@@ -134,10 +353,13 @@ final class _ContactsPageState extends State<ContactsPage> {
           mediaPicker: widget.mediaPicker,
           beforeMediaUpload: widget.beforeMediaUpload,
           conversation: AppImConversation.virtualSingle(
+            organization: contact.organization,
             userId: contact.userId,
             title: contact.displayName,
             account: contact.account,
             avatarUrl: contact.avatarUrl,
+            companyName: contact.companyName,
+            isCrossOrganization: contact.isCrossOrganization,
           ),
         ),
       ),
@@ -150,6 +372,7 @@ final class _ContactsPageState extends State<ContactsPage> {
         builder: (_) => FriendRequestsPage(
           tenant: widget.tenant,
           session: widget.session,
+          im: widget.im,
           contacts: widget.contacts,
         ),
       ),
@@ -171,6 +394,7 @@ final class _ContactsPageState extends State<ContactsPage> {
                 builder: (_) => AddFriendPage(
                   tenant: widget.tenant,
                   session: widget.session,
+                  im: widget.im,
                   contacts: widget.contacts,
                 ),
               ),
@@ -207,6 +431,7 @@ final class _ContactsPageState extends State<ContactsPage> {
                   builder: (_) => AddFriendPage(
                     tenant: widget.tenant,
                     session: widget.session,
+                    im: widget.im,
                     contacts: widget.contacts,
                   ),
                 ),
@@ -245,7 +470,9 @@ final class _ContactsPageState extends State<ContactsPage> {
             else
               for (final contact in _filtered) ...[
                 _ContactTile(
-                  key: ValueKey('contact-${contact.userId}'),
+                  key: ValueKey(
+                    'contact-${contact.organization}-${contact.userId}',
+                  ),
                   contact: contact,
                   onTap: () => _openContact(contact),
                 ),
@@ -395,72 +622,152 @@ final class _ContactTile extends StatelessWidget {
   }
 }
 
-final class ContactProfilePage extends StatelessWidget {
+final class ContactProfilePage extends StatefulWidget {
   const ContactProfilePage({
     super.key,
     required this.contact,
+    required this.session,
+    required this.im,
+    required this.initiallyAvailable,
     required this.onMessage,
   });
 
   final AppContact contact;
+  final AppSession session;
+  final AppImRuntime im;
+  final bool initiallyAvailable;
   final Future<void> Function() onMessage;
 
   @override
+  State<ContactProfilePage> createState() => _ContactProfilePageState();
+}
+
+final class _ContactProfilePageState extends State<ContactProfilePage> {
+  StreamSubscription<AppImEvent>? _eventSubscription;
+  bool _invalidated = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (!widget.initiallyAvailable) {
+      _invalidated = true;
+      _schedulePop();
+      return;
+    }
+    if (!widget.contact.isCrossOrganization) return;
+    _eventSubscription = widget.im.events.listen(
+      (event) {
+        if (event.connectionStatus == AppImConnectionStatus.connected) {
+          _invalidate();
+          return;
+        }
+        final accessChanged = event.accessChanged;
+        if (accessChanged != null &&
+            appImSameIdentity(
+              accessChanged.targetOrganization,
+              accessChanged.targetUserId,
+              widget.session.organization,
+              widget.session.user.userId,
+            ) &&
+            appImSameIdentity(
+              accessChanged.peerOrganization,
+              accessChanged.peerUserId,
+              widget.contact.organization,
+              widget.contact.userId,
+            )) {
+          _invalidate();
+        }
+      },
+      onError: (Object error) {
+        if (isAppImAccessSnapshotFailure(error)) _invalidate();
+      },
+    );
+  }
+
+  void _invalidate() {
+    if (_invalidated || !mounted) return;
+    setState(() => _invalidated = true);
+    _schedulePop();
+  }
+
+  void _schedulePop() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    unawaited(_eventSubscription?.cancel());
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final contact = widget.contact;
     return Scaffold(
       appBar: AppBar(title: const Text('个人名片')),
-      body: ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                children: [
-                  B8Avatar(
-                    label: contact.displayName,
-                    imageUrl: contact.avatarUrl,
-                    size: 82,
-                  ),
-                  const SizedBox(height: 18),
-                  Text(
-                    contact.displayName,
-                    style: Theme.of(context).textTheme.headlineSmall,
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    contact.signature.isEmpty ? '暂无个性签名' : contact.signature,
-                    style: const TextStyle(color: B8Colors.muted),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 16),
-          Card(
-            child: Column(
+      body: _invalidated
+          ? const Center(child: Text('联系人访问状态已更新'))
+          : ListView(
+              padding: const EdgeInsets.all(20),
               children: [
-                _ProfileRow(label: '账号', value: contact.account),
-                _ProfileRow(
-                  label: 'B8 ID',
-                  value: contact.imShortNo.isEmpty
-                      ? contact.userId
-                      : contact.imShortNo,
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      children: [
+                        B8Avatar(
+                          label: contact.displayName,
+                          imageUrl: contact.avatarUrl,
+                          size: 82,
+                        ),
+                        const SizedBox(height: 18),
+                        Text(
+                          contact.displayName,
+                          style: Theme.of(context).textTheme.headlineSmall,
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          contact.signature.isEmpty
+                              ? '暂无个性签名'
+                              : contact.signature,
+                          style: const TextStyle(color: B8Colors.muted),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
-                if (contact.mobile.isNotEmpty)
-                  _ProfileRow(label: '手机号', value: contact.mobile),
+                const SizedBox(height: 16),
+                Card(
+                  child: Column(
+                    children: [
+                      _ProfileRow(label: '账号', value: contact.account),
+                      _ProfileRow(
+                        label: 'B8 ID',
+                        value: contact.imShortNo.isEmpty
+                            ? contact.userId
+                            : contact.imShortNo,
+                      ),
+                      if (contact.mobile.isNotEmpty)
+                        _ProfileRow(label: '手机号', value: contact.mobile),
+                      if (contact.isCrossOrganization &&
+                          contact.companyName.isNotEmpty)
+                        _ProfileRow(label: '所属公司', value: contact.companyName),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 22),
+                FilledButton.icon(
+                  key: const ValueKey('contact-message'),
+                  onPressed: widget.onMessage,
+                  icon: const Icon(Icons.chat_bubble_outline_rounded),
+                  label: const Text('发消息'),
+                ),
               ],
             ),
-          ),
-          const SizedBox(height: 22),
-          FilledButton.icon(
-            key: const ValueKey('contact-message'),
-            onPressed: onMessage,
-            icon: const Icon(Icons.chat_bubble_outline_rounded),
-            label: const Text('发消息'),
-          ),
-        ],
-      ),
     );
   }
 }
@@ -493,11 +800,13 @@ final class FriendRequestsPage extends StatefulWidget {
     super.key,
     required this.tenant,
     required this.session,
+    required this.im,
     required this.contacts,
   });
 
   final TenantConfig tenant;
   final AppSession session;
+  final AppImRuntime im;
   final AppContactGateway contacts;
 
   @override
@@ -508,14 +817,151 @@ final class _FriendRequestsPageState extends State<FriendRequestsPage> {
   List<AppFriendRequest> _requests = const [];
   bool _loading = true;
   String? _error;
+  StreamSubscription<AppImEvent>? _eventSubscription;
+  late final AppImAccessEventGate _accessGate;
+  final Set<String> _revokedPeerIdentities = {};
+  final Set<String> _pendingRestorePeerIdentities = {};
+  int _accessEpoch = 0;
 
   @override
   void initState() {
     super.initState();
+    _accessGate = AppImAccessEventGate(
+      widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+    );
+    _accessGate.reconcileConnectionSnapshot(
+      current: widget.im.bootstrap.crossOrgAccessSnapshotId,
+      highestPositive: widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+    );
+    _eventSubscription = widget.im.events.listen(
+      (event) {
+        if (event.connectionStatus == AppImConnectionStatus.connected) {
+          final snapshot = _accessGate.reconcileConnectionSnapshot(
+            current: widget.im.bootstrap.crossOrgAccessSnapshotId,
+            highestPositive:
+                widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+          );
+          if (snapshot == AppImAccessSnapshotObservation.invalid ||
+              snapshot == AppImAccessSnapshotObservation.stale ||
+              _accessGate.isCrossOrganizationFailClosed) {
+            _failCloseCrossOrganization();
+          } else {
+            _accessEpoch += 1;
+            _hideCrossOrganizationRequests();
+            _revokedPeerIdentities.clear();
+            _pendingRestorePeerIdentities.clear();
+            for (final accessChanged in widget.im.recentAccessChanges) {
+              _applyAccessChanged(accessChanged);
+            }
+            unawaited(_load());
+          }
+          return;
+        }
+        final accessChanged = event.accessChanged;
+        if (accessChanged != null) _applyAccessChanged(accessChanged);
+      },
+      onError: (Object error) {
+        if (isAppImAccessSnapshotFailure(error)) {
+          _failCloseCrossOrganization(error: error);
+        }
+      },
+    );
+    for (final accessChanged in widget.im.recentAccessChanges) {
+      _applyAccessChanged(accessChanged);
+    }
+    if (_accessGate.isCrossOrganizationFailClosed) {
+      _failCloseCrossOrganization();
+    }
     unawaited(_load());
   }
 
-  Future<void> _load() async {
+  void _applyAccessChanged(AppImConversationAccessChanged accessChanged) {
+    if (!appImSameIdentity(
+          accessChanged.targetOrganization,
+          accessChanged.targetUserId,
+          widget.session.organization,
+          widget.session.user.userId,
+        ) ||
+        _accessGate.observe(accessChanged) != AppImAccessEventDecision.apply) {
+      return;
+    }
+    final key = _contactIdentityKey(
+      accessChanged.peerOrganization,
+      accessChanged.peerUserId,
+    );
+    _accessEpoch += 1;
+    if (accessChanged.allowed) {
+      _pendingRestorePeerIdentities.add(key);
+      _revokedPeerIdentities.add(key);
+      _hidePeerRequest(key);
+      unawaited(_load(restoringPeerKey: key));
+      return;
+    } else {
+      _pendingRestorePeerIdentities.remove(key);
+      _revokedPeerIdentities.add(key);
+      _hidePeerRequest(key);
+    }
+    unawaited(_load());
+  }
+
+  void _hidePeerRequest(String key) {
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _requests = _requests
+          .where((item) {
+            final requestKey = _friendRequestPeerKey(
+              item,
+              widget.session.organization,
+            );
+            return requestKey != null && requestKey != key;
+          })
+          .toList(growable: false);
+    });
+  }
+
+  void _hideCrossOrganizationRequests() {
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _requests = _requests
+          .where((item) {
+            return _friendRequestPeerKey(item, widget.session.organization) !=
+                    null &&
+                item.peerOrganization == widget.session.organization;
+          })
+          .toList(growable: false);
+    });
+  }
+
+  void _failCloseCrossOrganization({Object? error}) {
+    _accessEpoch += 1;
+    _accessGate.resetSnapshot('0');
+    _pendingRestorePeerIdentities.clear();
+    final visible = _requests
+        .where((item) {
+          return _friendRequestPeerKey(item, widget.session.organization) !=
+                  null &&
+              item.peerOrganization == widget.session.organization;
+        })
+        .toList(growable: false);
+    if (mounted) {
+      setState(() {
+        _loading = false;
+        _requests = visible;
+        if (error != null) _error = error.toString();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    unawaited(_eventSubscription?.cancel());
+    super.dispose();
+  }
+
+  Future<void> _load({String? restoringPeerKey}) async {
+    final accessEpoch = _accessEpoch;
     setState(() {
       _loading = true;
       _error = null;
@@ -525,22 +971,62 @@ final class _FriendRequestsPageState extends State<FriendRequestsPage> {
         tenant: widget.tenant,
         session: widget.session,
       );
-      if (mounted) setState(() => _requests = result);
+      if (accessEpoch != _accessEpoch) return;
+      if (restoringPeerKey != null) {
+        _pendingRestorePeerIdentities.add(restoringPeerKey);
+      }
+      final confirmedRestoreKeys = result
+          .map(
+            (request) =>
+                _friendRequestPeerKey(request, widget.session.organization),
+          )
+          .whereType<String>()
+          .where(_pendingRestorePeerIdentities.contains)
+          .toSet();
+      _revokedPeerIdentities.removeAll(confirmedRestoreKeys);
+      _pendingRestorePeerIdentities.removeAll(confirmedRestoreKeys);
+      final visible = result
+          .where((item) {
+            final key = _friendRequestPeerKey(
+              item,
+              widget.session.organization,
+            );
+            return key != null &&
+                (item.peerOrganization == widget.session.organization ||
+                    !_accessGate.isCrossOrganizationFailClosed) &&
+                !_revokedPeerIdentities.contains(key);
+          })
+          .toList(growable: false);
+      if (mounted) setState(() => _requests = visible);
     } on Object catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _error = error.toString());
+      }
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _loading = false);
+      }
     }
   }
 
   Future<void> _handle(AppFriendRequest request, bool accept) async {
+    final accessEpoch = _accessEpoch;
+    final peerKey = _friendRequestPeerKey(request, widget.session.organization);
+    if (peerKey == null ||
+        !request.isPendingIncoming ||
+        (request.peerOrganization != widget.session.organization &&
+            (_accessGate.isCrossOrganizationFailClosed ||
+                _revokedPeerIdentities.contains(peerKey)))) {
+      return;
+    }
     try {
       await widget.contacts.handleFriendRequest(
         tenant: widget.tenant,
         session: widget.session,
-        requestId: request.id,
+        request: request,
         accept: accept,
       );
+      if (!mounted || accessEpoch != _accessEpoch) return;
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -548,7 +1034,7 @@ final class _FriendRequestsPageState extends State<FriendRequestsPage> {
       }
       await _load();
     } on Object catch (error) {
-      if (mounted) {
+      if (mounted && accessEpoch == _accessEpoch) {
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text(error.toString())));
@@ -639,11 +1125,13 @@ final class AddFriendPage extends StatefulWidget {
     super.key,
     required this.tenant,
     required this.session,
+    required this.im,
     required this.contacts,
   });
 
   final TenantConfig tenant;
   final AppSession session;
+  final AppImRuntime im;
   final AppContactGateway contacts;
 
   @override
@@ -655,9 +1143,133 @@ final class _AddFriendPageState extends State<AddFriendPage> {
   List<AppContact> _results = const [];
   bool _searching = false;
   String? _error;
+  StreamSubscription<AppImEvent>? _eventSubscription;
+  late final AppImAccessEventGate _accessGate;
+  final Set<String> _revokedPeerIdentities = {};
+  final Set<String> _pendingRestorePeerIdentities = {};
+  int _accessEpoch = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _accessGate = AppImAccessEventGate(
+      widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+    );
+    _accessGate.reconcileConnectionSnapshot(
+      current: widget.im.bootstrap.crossOrgAccessSnapshotId,
+      highestPositive: widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+    );
+    _eventSubscription = widget.im.events.listen(
+      (event) {
+        if (event.connectionStatus == AppImConnectionStatus.connected) {
+          final snapshot = _accessGate.reconcileConnectionSnapshot(
+            current: widget.im.bootstrap.crossOrgAccessSnapshotId,
+            highestPositive:
+                widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+          );
+          if (snapshot == AppImAccessSnapshotObservation.invalid ||
+              snapshot == AppImAccessSnapshotObservation.stale ||
+              _accessGate.isCrossOrganizationFailClosed) {
+            _failCloseCrossOrganization();
+          } else {
+            _accessEpoch += 1;
+            _hideCrossOrganizationResults();
+            _revokedPeerIdentities.clear();
+            _pendingRestorePeerIdentities.clear();
+            for (final accessChanged in widget.im.recentAccessChanges) {
+              _applyAccessChanged(accessChanged);
+            }
+            if (_controller.text.trim().isNotEmpty) unawaited(_search());
+          }
+          return;
+        }
+        final accessChanged = event.accessChanged;
+        if (accessChanged != null) _applyAccessChanged(accessChanged);
+      },
+      onError: (Object error) {
+        if (isAppImAccessSnapshotFailure(error)) {
+          _failCloseCrossOrganization(error: error);
+        }
+      },
+    );
+    for (final accessChanged in widget.im.recentAccessChanges) {
+      _applyAccessChanged(accessChanged);
+    }
+    if (_accessGate.isCrossOrganizationFailClosed) {
+      _failCloseCrossOrganization();
+    }
+  }
+
+  void _applyAccessChanged(AppImConversationAccessChanged accessChanged) {
+    if (!appImSameIdentity(
+          accessChanged.targetOrganization,
+          accessChanged.targetUserId,
+          widget.session.organization,
+          widget.session.user.userId,
+        ) ||
+        _accessGate.observe(accessChanged) != AppImAccessEventDecision.apply) {
+      return;
+    }
+    final key = _contactIdentityKey(
+      accessChanged.peerOrganization,
+      accessChanged.peerUserId,
+    );
+    _accessEpoch += 1;
+    if (accessChanged.allowed) {
+      _pendingRestorePeerIdentities.add(key);
+      _revokedPeerIdentities.add(key);
+      _hidePeerResult(key);
+      if (_controller.text.trim().isNotEmpty) unawaited(_search());
+      return;
+    } else {
+      _pendingRestorePeerIdentities.remove(key);
+      _revokedPeerIdentities.add(key);
+      _hidePeerResult(key);
+    }
+  }
+
+  void _hidePeerResult(String key) {
+    if (!mounted) return;
+    setState(() {
+      _searching = false;
+      _results = _results
+          .where(
+            (item) =>
+                _contactIdentityKey(item.organization, item.userId) != key,
+          )
+          .toList(growable: false);
+    });
+  }
+
+  void _hideCrossOrganizationResults() {
+    if (!mounted) return;
+    setState(() {
+      _searching = false;
+      _results = _results
+          .where((item) => item.organization == widget.session.organization)
+          .toList(growable: false);
+    });
+  }
+
+  void _failCloseCrossOrganization({Object? error}) {
+    _accessEpoch += 1;
+    _accessGate.resetSnapshot('0');
+    _pendingRestorePeerIdentities.clear();
+    final visible = _results
+        .where((item) => item.organization == widget.session.organization)
+        .toList(growable: false);
+    if (mounted) {
+      setState(() {
+        _searching = false;
+        _results = visible;
+        if (error != null) _error = error.toString();
+      });
+    }
+  }
 
   @override
   void dispose() {
+    unawaited(_eventSubscription?.cancel());
     _controller.dispose();
     super.dispose();
   }
@@ -665,6 +1277,7 @@ final class _AddFriendPageState extends State<AddFriendPage> {
   Future<void> _search() async {
     final keyword = _controller.text.trim();
     if (keyword.isEmpty) return;
+    final accessEpoch = _accessEpoch;
     setState(() {
       _searching = true;
       _error = null;
@@ -675,22 +1288,52 @@ final class _AddFriendPageState extends State<AddFriendPage> {
         session: widget.session,
         keyword: keyword,
       );
-      if (mounted) setState(() => _results = result);
+      if (accessEpoch != _accessEpoch) return;
+      for (final item in result) {
+        final key = _contactIdentityKey(item.organization, item.userId);
+        if (_pendingRestorePeerIdentities.remove(key)) {
+          _revokedPeerIdentities.remove(key);
+        }
+      }
+      final visible = result
+          .where(
+            (item) =>
+                (item.organization == widget.session.organization ||
+                    !_accessGate.isCrossOrganizationFailClosed) &&
+                !_revokedPeerIdentities.contains(
+                  _contactIdentityKey(item.organization, item.userId),
+                ),
+          )
+          .toList(growable: false);
+      if (mounted) setState(() => _results = visible);
     } on Object catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _error = error.toString());
+      }
     } finally {
-      if (mounted) setState(() => _searching = false);
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _searching = false);
+      }
     }
   }
 
   Future<void> _add(AppContact contact) async {
+    final accessEpoch = _accessEpoch;
+    final key = _contactIdentityKey(contact.organization, contact.userId);
+    if (contact.organization != widget.session.organization &&
+        (_accessGate.isCrossOrganizationFailClosed ||
+            _revokedPeerIdentities.contains(key))) {
+      return;
+    }
     try {
       final message = await widget.contacts.sendFriendRequest(
         tenant: widget.tenant,
         session: widget.session,
+        organization: contact.organization,
         userId: contact.userId,
         message: '我是 ${widget.session.user.nickname}',
       );
+      if (!mounted || accessEpoch != _accessEpoch) return;
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -698,7 +1341,7 @@ final class _AddFriendPageState extends State<AddFriendPage> {
       }
       await _search();
     } on Object catch (error) {
-      if (mounted) {
+      if (mounted && accessEpoch == _accessEpoch) {
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text(error.toString())));

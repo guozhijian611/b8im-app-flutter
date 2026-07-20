@@ -54,11 +54,13 @@ void main() {
               'messages': [
                 {
                   'id': 1,
+                  'organization': 1,
                   'conversation_id': 'conversation-01',
                   'conversation_type': 1,
                   'message_id': 'message-01',
                   'message_seq': 1,
                   'client_msg_id': 'client-01',
+                  'sender_organization': 1,
                   'sender_id': 'user-01',
                   'sender_user': null,
                   'message_type': 1,

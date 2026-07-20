@@ -1,0 +1,49 @@
+name: quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: flutter-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require private module read token
+        env:
+          B8IM_CI_READ_TOKEN: ${{ secrets.B8IM_CI_READ_TOKEN }}
+        run: |
+          if [ -z "$B8IM_CI_READ_TOKEN" ]; then
+            echo "B8IM_CI_READ_TOKEN must read the private b8im-module-file-media repository." >&2
+            exit 1
+          fi
+      - name: Checkout Flutter app
+        uses: actions/checkout@v4
+        with:
+          path: b8im-app-flutter
+      - name: Checkout file media path dependency
+        uses: actions/checkout@v4
+        with:
+          repository: guozhijian611/b8im-module-file-media
+          token: ${{ secrets.B8IM_CI_READ_TOKEN }}
+          path: b8im-module-file-media
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+        working-directory: b8im-app-flutter
+      - run: dart format --output=none --set-exit-if-changed lib test
+        working-directory: b8im-app-flutter
+      - run: dart analyze
+        working-directory: b8im-app-flutter
+      - run: flutter test
+        working-directory: b8im-app-flutter

@@ -13,6 +13,7 @@ abstract interface class AppMessagingGateway {
     required TenantConfig tenant,
     required AppSession session,
     required String conversationId,
+    int peerOrganization = 0,
     String peerUserId = '',
     int beforeSeq = 0,
     int limit = 50,
@@ -51,15 +52,17 @@ final class AppMessagingService implements AppMessagingGateway {
     required TenantConfig tenant,
     required AppSession session,
     required String conversationId,
+    int peerOrganization = 0,
     String peerUserId = '',
     int beforeSeq = 0,
     int limit = 50,
   }) async {
     final normalizedConversationId = conversationId.trim();
     final normalizedPeerUserId = peerUserId.trim();
-    if ((normalizedConversationId.isEmpty && normalizedPeerUserId.isEmpty) ||
+    if ((normalizedConversationId.isEmpty &&
+            (peerOrganization <= 0 || normalizedPeerUserId.isEmpty)) ||
         (normalizedConversationId.isNotEmpty &&
-            normalizedPeerUserId.isNotEmpty) ||
+            (peerOrganization > 0 || normalizedPeerUserId.isNotEmpty)) ||
         beforeSeq < 0) {
       throw const FormatException('消息分页参数无效');
     }
@@ -70,6 +73,8 @@ final class AppMessagingService implements AppMessagingGateway {
       query: {
         if (normalizedConversationId.isNotEmpty)
           'conversation_id': normalizedConversationId,
+        if (normalizedPeerUserId.isNotEmpty)
+          'peer_organization': peerOrganization.toString(),
         if (normalizedPeerUserId.isNotEmpty)
           'peer_user_id': normalizedPeerUserId,
         'before_seq': beforeSeq.toString(),

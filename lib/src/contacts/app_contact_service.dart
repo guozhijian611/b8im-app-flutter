@@ -24,6 +24,7 @@ abstract interface class AppContactGateway {
   Future<String> sendFriendRequest({
     required TenantConfig tenant,
     required AppSession session,
+    required int organization,
     required String userId,
     required String message,
   });
@@ -31,7 +32,7 @@ abstract interface class AppContactGateway {
   Future<void> handleFriendRequest({
     required TenantConfig tenant,
     required AppSession session,
-    required int requestId,
+    required AppFriendRequest request,
     required bool accept,
   });
 }
@@ -91,16 +92,25 @@ final class AppContactService implements AppContactGateway {
   Future<String> sendFriendRequest({
     required TenantConfig tenant,
     required AppSession session,
+    required int organization,
     required String userId,
     required String message,
   }) async {
+    final targetUserId = userId.trim();
+    if (organization <= 0 || targetUserId.isEmpty) {
+      throw const FormatException('好友申请缺少目标复合身份');
+    }
     final data = contactMap(
       await api.request(
         tenant,
         '/saimulti/app/im/sendFriendRequest',
         method: AppApiMethod.post,
         accessToken: session.accessToken,
-        body: {'to_user_id': userId.trim(), 'message': message.trim()},
+        body: {
+          'to_organization': organization,
+          'to_user_id': targetUserId,
+          'message': message.trim(),
+        },
       ),
       'sendFriendRequest',
     );
@@ -111,15 +121,24 @@ final class AppContactService implements AppContactGateway {
   Future<void> handleFriendRequest({
     required TenantConfig tenant,
     required AppSession session,
-    required int requestId,
+    required AppFriendRequest request,
     required bool accept,
   }) async {
+    if (!request.isPendingIncoming ||
+        !request.hasAuthoritativeContext(session.organization)) {
+      throw const FormatException('好友申请缺少当前机构复合上下文');
+    }
     await api.request(
       tenant,
       '/saimulti/app/im/handleFriendRequest',
       method: AppApiMethod.post,
       accessToken: session.accessToken,
-      body: {'id': requestId, 'action': accept ? 'accept' : 'reject'},
+      body: {
+        'id': request.id,
+        'action': accept ? 'accept' : 'reject',
+        'from_organization': request.fromOrganization,
+        'to_organization': request.toOrganization,
+      },
     );
   }
 
