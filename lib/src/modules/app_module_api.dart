@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import '../discovery/tenant_config.dart';
 import '../network/app_api_client.dart';
 import '../session/app_session.dart';
@@ -139,18 +141,38 @@ final class SearchMessageHit {
   const SearchMessageHit({
     required this.messageId,
     required this.conversationId,
+    required this.senderOrganization,
     required this.senderUserId,
     required this.messageType,
+    required this.messageSeq,
     required this.content,
     required this.sentAt,
   });
 
   final String messageId;
   final String conversationId;
+  final int senderOrganization;
   final String senderUserId;
   final int messageType;
+  final int messageSeq;
   final String content;
-  final String sentAt;
+  final String? sentAt;
+
+  String get senderIdentityLabel => '机构 $senderOrganization · $senderUserId';
+}
+
+final class SearchMessageSenderFilter {
+  SearchMessageSenderFilter({
+    required int senderOrganization,
+    required String senderUserId,
+  }) : senderOrganization = _positiveJsonInt(
+         senderOrganization,
+         '搜索筛选.sender_organization',
+       ),
+       senderUserId = _canonicalAccessId(senderUserId, '搜索筛选.sender_user_id');
+
+  final int senderOrganization;
+  final String senderUserId;
 }
 
 final class StickerPackItem {
@@ -206,7 +228,10 @@ abstract interface class AppModuleGateway {
   Future<List<RobotSingleItem>> fetchRobots();
   Future<RobotReply> matchRobot(int robotId, String text);
 
-  Future<List<SearchMessageHit>> searchMessages(String keyword);
+  Future<List<SearchMessageHit>> searchMessages(
+    String keyword, {
+    SearchMessageSenderFilter? sender,
+  });
 
   Future<List<StickerPackItem>> fetchStickerPacks();
   Future<List<StickerAssetItem>> fetchStickerItems(int packId);
@@ -465,34 +490,57 @@ final class AppModuleApiService implements AppModuleGateway {
   }
 
   @override
-  Future<List<SearchMessageHit>> searchMessages(String keyword) async {
+  Future<List<SearchMessageHit>> searchMessages(
+    String keyword, {
+    SearchMessageSenderFilter? sender,
+  }) async {
+    final query = <String, String>{
+      'q': keyword.trim(),
+      'page': '1',
+      'limit': '50',
+      if (sender != null) ...{
+        'sender_organization': '${sender.senderOrganization}',
+        'sender_user_id': sender.senderUserId,
+      },
+    };
     final rows = _pageRows(
-      await _get('/saimulti/app/search/messages', {
-        'q': keyword.trim(),
-        'page': '1',
-        'limit': '50',
-      }),
+      await _get('/saimulti/app/search/messages', query),
       '消息搜索',
     );
     return rows
         .map((row) {
           final item = _map(row, '搜索结果');
           return SearchMessageHit(
-            messageId: _string(item['message_id'], '搜索结果.message_id'),
-            conversationId: _string(
+            messageId: _canonicalAccessId(
+              item['message_id'],
+              '搜索结果.message_id',
+            ),
+            conversationId: _canonicalAccessId(
               item['conversation_id'],
               '搜索结果.conversation_id',
             ),
-            senderUserId: _string(
+            senderOrganization: _positiveJsonInt(
+              item['sender_organization'],
+              '搜索结果.sender_organization',
+            ),
+            senderUserId: _canonicalAccessId(
               item['sender_user_id'],
               '搜索结果.sender_user_id',
             ),
-            messageType: _positiveInt(
+            messageType: _positiveJsonInt(
               item['message_type'],
               '搜索结果.message_type',
             ),
-            content: _string(item['content'], '搜索结果.content'),
-            sentAt: _optionalString(item['sent_at'], '搜索结果.sent_at'),
+            messageSeq: _positiveJsonInt(
+              item['message_seq'],
+              '搜索结果.message_seq',
+            ),
+            content: _jsonString(item['content'], '搜索结果.content'),
+            sentAt: _requiredNullableNonemptyString(
+              item,
+              'sent_at',
+              '搜索结果.sent_at',
+            ),
           );
         })
         .toList(growable: false);
@@ -640,10 +688,56 @@ String _optionalString(Object? value, String field) {
   return value.toString().trim();
 }
 
+String _jsonString(Object? value, String field) {
+  if (value is! String) throw FormatException('$field 格式无效');
+  return value;
+}
+
+String? _requiredNullableNonemptyString(
+  Map<String, Object?> value,
+  String key,
+  String field,
+) {
+  if (!value.containsKey(key)) throw FormatException('$field 格式无效');
+  final item = value[key];
+  if (item == null) return null;
+  if (item is! String || item.trim().isEmpty) {
+    throw FormatException('$field 格式无效');
+  }
+  return item;
+}
+
 int _positiveInt(Object? value, String field) {
   final integer = _integer(value, field);
   if (integer <= 0) throw FormatException('$field 格式无效');
   return integer;
+}
+
+int _positiveJsonInt(Object? value, String field) {
+  if (value is! int || value <= 0 || value > 9007199254740991) {
+    throw FormatException('$field 格式无效');
+  }
+  return value;
+}
+
+const _invalidAccessIdFragments = <String>[
+  '\u0000',
+  '\u0009',
+  '\u000A',
+  '\u000B',
+  '\u000D',
+  '|',
+];
+
+String _canonicalAccessId(Object? value, String field) {
+  if (value is! String ||
+      value.isEmpty ||
+      utf8.encode(value).length > 64 ||
+      value.trim() != value ||
+      _invalidAccessIdFragments.any(value.contains)) {
+    throw FormatException('$field 格式无效');
+  }
+  return value;
 }
 
 int _nonNegativeInt(Object? value, String field) {
