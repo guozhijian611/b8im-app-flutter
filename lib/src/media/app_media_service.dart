@@ -6,8 +6,16 @@ import 'package:http/http.dart' as http;
 import '../discovery/tenant_config.dart';
 import '../im/group_member_access.dart';
 import '../network/app_api_client.dart';
+import '../observability/trace_context.dart';
 import '../session/app_session.dart';
 import 'app_documents_directory.dart';
+
+const _appUploadPath = '/saimulti/app/im/upload';
+const _appReleaseUploadPath = '/saimulti/app/im/releaseUpload';
+const _defaultMimeType = 'application/octet-stream';
+const _uploadReservationClockSkew = Duration(seconds: 30);
+final _uploadIdPattern = RegExp(r'^[0-9a-f]{64}$');
+final _idempotencyKeyPattern = RegExp(r'^[0-9a-f]{32}$');
 
 enum AppMediaKind {
   image(messageType: 2, wireName: 'image'),
@@ -133,9 +141,15 @@ final class AppMediaService implements AppMediaGateway {
     required int size,
     required String mimeType,
   }) async {
-    if (size <= 0 || filename.trim().isEmpty || mimeType.trim().isEmpty) {
+    final canonicalFilename = filename.trim();
+    if (size <= 0 || canonicalFilename.isEmpty) {
       throw const FormatException('上传文件元数据无效');
     }
+    final canonicalMimeType = mimeType.trim().isEmpty
+        ? _defaultMimeType
+        : mimeType.trim();
+    final canonicalExtension = _filenameExtension(canonicalFilename);
+    final idempotencyKey = _createUploadIdempotencyKey();
     final access = _captureAccess(
       session,
       conversationType: conversationType,
@@ -143,59 +157,108 @@ final class AppMediaService implements AppMediaGateway {
       requireActive: true,
     );
     final operation = _beginOperation(access);
+    String? uploadId;
+    var confirmed = false;
     try {
       final preparedPayload = await _withTransport(
         operation,
         _apiTransportFactory,
-        (client) => _api.request(
-          tenant,
-          '/saimulti/app/im/prepareUpload',
-          method: AppApiMethod.post,
-          accessToken: session.accessToken,
-          body: {
-            'kind': kind.wireName,
-            'filename': filename,
-            'size': size,
-            'mime_type': mimeType,
-          },
-          requestClient: client,
-        ),
+        (client) async {
+          final payload = await _api.request(
+            tenant,
+            '/saimulti/app/im/prepareUpload',
+            method: AppApiMethod.post,
+            accessToken: session.accessToken,
+            body: {
+              'idempotency_key': idempotencyKey,
+              'kind': kind.wireName,
+              'filename': canonicalFilename,
+              'size': size,
+              'mime_type': canonicalMimeType,
+            },
+            requestClient: client,
+          );
+          if (payload is Map) {
+            uploadId = _preparedUploadId(_map(payload, 'prepare upload'));
+          }
+          return payload;
+        },
+      );
+      final prepared = _map(preparedPayload, 'prepare upload');
+      _assertPreparedUpload(
+        prepared,
+        uploadId: uploadId,
+        filename: canonicalFilename,
+        size: size,
+        mimeType: canonicalMimeType,
+        extension: canonicalExtension,
       );
       access.assertCurrent();
-      final prepared = _map(preparedPayload, 'prepare upload');
-      final uploadPath = _string(prepared, 'upload_path');
-      if (prepared['mode'] != 'proxy' ||
-          prepared['method'] != 'POST' ||
-          uploadPath != '/saimulti/app/im/upload') {
-        throw const FormatException('App 上传准备响应无效');
-      }
-      final upload = AppMediaUpload.fromJson(
-        await _withTransport(
-          operation,
-          _apiTransportFactory,
-          (client) => _api.multipart(
+      final uploadPayload = await _withTransport(
+        operation,
+        _apiTransportFactory,
+        (client) async {
+          final payload = await _api.multipart(
             tenant,
-            uploadPath,
+            _appUploadPath,
             accessToken: session.accessToken,
             filePath: filePath,
-            filename: filename,
-            mimeType: mimeType,
-            fields: {'kind': kind.wireName},
+            filename: canonicalFilename,
+            mimeType: canonicalMimeType,
+            fields: {'upload_id': uploadId!},
             requestTimeout: uploadTimeout,
             requestClient: client,
-          ),
-        ),
+          );
+          confirmed = true;
+          return payload;
+        },
       );
       access.assertCurrent();
+      final upload = AppMediaUpload.fromJson(uploadPayload);
       if (upload.kind != kind ||
-          upload.name != filename ||
-          upload.size != size) {
+          upload.name != canonicalFilename ||
+          upload.size != size ||
+          upload.mimeType != canonicalMimeType ||
+          upload.extension != canonicalExtension) {
         throw const FormatException('上传结果与源文件不一致');
       }
       access.assertCurrent();
       return upload;
+    } on Object catch (error, stackTrace) {
+      final reservationId = uploadId;
+      if (reservationId != null && !confirmed) {
+        await _releaseUploadBestEffort(
+          tenant: tenant,
+          session: session,
+          uploadId: reservationId,
+        );
+      }
+      Error.throwWithStackTrace(error, stackTrace);
     } finally {
       _finishOperation(access, operation);
+    }
+  }
+
+  Future<void> _releaseUploadBestEffort({
+    required TenantConfig tenant,
+    required AppSession session,
+    required String uploadId,
+  }) async {
+    http.Client? client;
+    try {
+      client = _apiTransportFactory();
+      await _api.request(
+        tenant,
+        _appReleaseUploadPath,
+        method: AppApiMethod.post,
+        accessToken: session.accessToken,
+        body: {'upload_id': uploadId},
+        requestClient: client,
+      );
+    } on Object {
+      // Best-effort cleanup must preserve the original upload failure.
+    } finally {
+      client?.close();
     }
   }
 
@@ -712,6 +775,52 @@ int _integer(Map<String, Object?> map, String key) {
   final value = map[key];
   if (value is! int) throw FormatException('$key 格式无效');
   return value;
+}
+
+String _createUploadIdempotencyKey() {
+  final value = TraceContext.root().traceId;
+  if (!_idempotencyKeyPattern.hasMatch(value) ||
+      RegExp(r'^0+$').hasMatch(value)) {
+    throw StateError('安全随机上传幂等键生成失败');
+  }
+  return value;
+}
+
+String? _preparedUploadId(Map<String, Object?> prepared) {
+  final value = prepared['upload_id'];
+  return value is String && _uploadIdPattern.hasMatch(value) ? value : null;
+}
+
+void _assertPreparedUpload(
+  Map<String, Object?> prepared, {
+  required String? uploadId,
+  required String filename,
+  required int size,
+  required String mimeType,
+  required String extension,
+}) {
+  final expiresAt = prepared['expires_at'];
+  final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+  if (prepared['mode'] != 'proxy' ||
+      prepared['method'] != 'POST' ||
+      prepared['upload_path'] != _appUploadPath ||
+      uploadId == null ||
+      expiresAt is! int ||
+      expiresAt <= now + _uploadReservationClockSkew.inSeconds ||
+      prepared['filename'] != filename ||
+      prepared['size'] is! int ||
+      prepared['size'] != size ||
+      prepared['mime_type'] != mimeType ||
+      prepared['extension'] != extension) {
+    throw const FormatException('App 上传准备响应无效');
+  }
+}
+
+String _filenameExtension(String filename) {
+  final separator = filename.lastIndexOf('.');
+  return separator >= 0 && separator < filename.length - 1
+      ? filename.substring(separator + 1).toLowerCase()
+      : '';
 }
 
 String _safeFilename(String value) {

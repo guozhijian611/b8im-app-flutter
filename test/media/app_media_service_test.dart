@@ -18,15 +18,40 @@ void main() {
     final file = File('${directory.path}/photo.png');
     await file.writeAsBytes([137, 80, 78, 71]);
     final paths = <String>[];
+    String? idempotencyKey;
     Future<http.Response> handleApi(http.Request request) async {
       paths.add(request.url.path);
       expect(request.headers['app-id'], '1');
       expect(request.headers['authorization'], 'Bearer access-token');
+      if (request.url.path == '/saimulti/app/im/prepareUpload') {
+        final body = jsonDecode(request.body) as Map<String, Object?>;
+        idempotencyKey = body['idempotency_key'] as String?;
+        expect(idempotencyKey, matches(RegExp(r'^[0-9a-f]{32}$')));
+        expect(body, {
+          'idempotency_key': idempotencyKey,
+          'kind': 'image',
+          'filename': 'photo.png',
+          'size': 4,
+          'mime_type': 'image/png',
+        });
+      }
+      if (request.url.path == '/saimulti/app/im/upload') {
+        final multipartBody = utf8.decode(
+          request.bodyBytes,
+          allowMalformed: true,
+        );
+        expect(multipartBody, contains('name="file"'));
+        expect(multipartBody, contains('name="upload_id"'));
+        expect(multipartBody, contains(_uploadId));
+        expect(multipartBody, isNot(contains('name="kind"')));
+      }
       final data = switch (request.url.path) {
         '/saimulti/app/im/prepareUpload' => {
           'mode': 'proxy',
           'upload_path': '/saimulti/app/im/upload',
           'method': 'POST',
+          'upload_id': _uploadId,
+          'expires_at': DateTime.now().millisecondsSinceEpoch ~/ 1000 + 300,
           'filename': 'photo.png',
           'size': 4,
           'mime_type': 'image/png',
@@ -86,12 +111,257 @@ void main() {
     );
 
     expect(upload.kind, AppMediaKind.image);
+    expect(idempotencyKey, isNotNull);
     expect(url.toString(), 'https://private.example.test/signed-photo');
     expect(paths, [
       '/saimulti/app/im/prepareUpload',
       '/saimulti/app/im/upload',
       '/saimulti/app/im/resolveAssetUrl',
     ]);
+    service.close();
+    api.close();
+    await directory.delete(recursive: true);
+  });
+
+  test('MIME 为空时 prepare 与 multipart 统一使用 octet-stream', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'b8im-media-default-mime-',
+    );
+    final file = File(directory.uri.resolve('archive.zip').toFilePath());
+    await file.writeAsBytes([1, 2, 3]);
+    final paths = <String>[];
+    Future<http.Response> handleApi(http.Request request) async {
+      paths.add(request.url.path);
+      if (request.url.path == '/saimulti/app/im/prepareUpload') {
+        final body = jsonDecode(request.body) as Map<String, Object?>;
+        expect(body['mime_type'], 'application/octet-stream');
+        expect(body['idempotency_key'], matches(RegExp(r'^[0-9a-f]{32}$')));
+        return _apiSuccess(
+          _preparePayload(
+            filename: 'archive.zip',
+            size: 3,
+            mimeType: 'application/octet-stream',
+            extension: 'zip',
+          ),
+        );
+      }
+      if (request.url.path == '/saimulti/app/im/upload') {
+        expect(request.body, contains('name="file"'));
+        expect(request.body, contains('name="upload_id"'));
+        expect(request.body, contains('application/octet-stream'));
+        expect(request.body, isNot(contains('name="kind"')));
+        return _apiSuccess({
+          'file_id': _bFileId,
+          'kind': 'file',
+          'name': 'archive.zip',
+          'size': 3,
+          'mime_type': 'application/octet-stream',
+          'extension': 'zip',
+        });
+      }
+      throw StateError('unexpected path ${request.url.path}');
+    }
+
+    final api = AppApiClient(
+      httpClient: MockClient(handleApi),
+      requestClientFactory: () => MockClient(handleApi),
+    );
+    final service = AppMediaService(api);
+    final upload = await service.upload(
+      tenant: tenantFixture(),
+      session: _session,
+      kind: AppMediaKind.file,
+      conversationType: 1,
+      conversationId: 'conversation-01',
+      filePath: file.path,
+      filename: 'archive.zip',
+      size: 3,
+      mimeType: '  ',
+    );
+
+    expect(upload.mimeType, 'application/octet-stream');
+    expect(paths, [
+      '/saimulti/app/im/prepareUpload',
+      '/saimulti/app/im/upload',
+    ]);
+    service.close();
+    api.close();
+    await directory.delete(recursive: true);
+  });
+
+  test('prepare 响应逐字段严格校验并释放可识别 reservation', () async {
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final cases = <String, Map<String, Object?>>{
+      'mode': {..._preparePayload(), 'mode': 'direct'},
+      'method': {..._preparePayload(), 'method': 'PUT'},
+      'upload_path': {
+        ..._preparePayload(),
+        'upload_path': '/saimulti/web/im/upload',
+      },
+      'upload_id': {..._preparePayload(), 'upload_id': _uploadId.toUpperCase()},
+      'expires_at type': {..._preparePayload(), 'expires_at': '$now'},
+      'expires_at stale': {..._preparePayload(), 'expires_at': now},
+      'filename': {..._preparePayload(), 'filename': 'other.txt'},
+      'size': {..._preparePayload(), 'size': 4},
+      'size type': {..._preparePayload(), 'size': 3.0},
+      'mime_type': {..._preparePayload(), 'mime_type': 'text/plain'},
+      'extension': {..._preparePayload(), 'extension': 'TXT'},
+    };
+
+    for (final entry in cases.entries) {
+      final releases = <Map<String, Object?>>[];
+      Future<http.Response> handleApi(http.Request request) async {
+        if (request.url.path == '/saimulti/app/im/prepareUpload') {
+          return _apiSuccess(entry.value);
+        }
+        if (request.url.path == '/saimulti/app/im/releaseUpload') {
+          releases.add(jsonDecode(request.body) as Map<String, Object?>);
+          return _apiSuccess({'released': true, 'state': 'released'});
+        }
+        throw StateError('unexpected path ${request.url.path}');
+      }
+
+      final api = AppApiClient(
+        httpClient: MockClient(handleApi),
+        requestClientFactory: () => MockClient(handleApi),
+      );
+      final service = AppMediaService(api);
+      await expectLater(
+        service.upload(
+          tenant: tenantFixture(),
+          session: _session,
+          kind: AppMediaKind.file,
+          conversationType: 1,
+          conversationId: 'conversation-01',
+          filePath: '/unused/report.txt',
+          filename: 'report.txt',
+          size: 3,
+          mimeType: 'application/octet-stream',
+        ),
+        throwsFormatException,
+        reason: entry.key,
+      );
+      expect(
+        releases,
+        entry.key == 'upload_id'
+            ? isEmpty
+            : [
+                {'upload_id': _uploadId},
+              ],
+        reason: entry.key,
+      );
+      service.close();
+      api.close();
+    }
+  });
+
+  test('release 失败不覆盖 multipart 的原始错误', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'b8im-media-release-failure-',
+    );
+    final file = File(directory.uri.resolve('report.txt').toFilePath());
+    await file.writeAsBytes([1, 2, 3]);
+    var transportCount = 0;
+    var releaseCount = 0;
+    Future<http.Response> handleApi(http.Request request) async {
+      if (request.url.path == '/saimulti/app/im/prepareUpload') {
+        return _apiSuccess(_preparePayload());
+      }
+      if (request.url.path == '/saimulti/app/im/upload') {
+        return _apiFailure('原始上传失败');
+      }
+      if (request.url.path == '/saimulti/app/im/releaseUpload') {
+        releaseCount += 1;
+        expect(jsonDecode(request.body), {'upload_id': _uploadId});
+        return _apiFailure('释放失败');
+      }
+      throw StateError('unexpected path ${request.url.path}');
+    }
+
+    final api = AppApiClient(
+      httpClient: MockClient(handleApi),
+      requestClientFactory: () {
+        transportCount += 1;
+        return MockClient(handleApi);
+      },
+    );
+    final service = AppMediaService(api);
+
+    await expectLater(
+      service.upload(
+        tenant: tenantFixture(),
+        session: _session,
+        kind: AppMediaKind.file,
+        conversationType: 1,
+        conversationId: 'conversation-01',
+        filePath: file.path,
+        filename: 'report.txt',
+        size: 3,
+        mimeType: 'application/octet-stream',
+      ),
+      throwsA(
+        isA<AppApiException>().having(
+          (error) => error.message,
+          'message',
+          '原始上传失败',
+        ),
+      ),
+    );
+    expect(releaseCount, 1);
+    expect(transportCount, 3);
+    service.close();
+    api.close();
+    await directory.delete(recursive: true);
+  });
+
+  test('Server 已确认后本地结果校验失败不再 release', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'b8im-media-confirmed-',
+    );
+    final file = File(directory.uri.resolve('report.txt').toFilePath());
+    await file.writeAsBytes([1, 2, 3]);
+    var releaseCount = 0;
+    Future<http.Response> handleApi(http.Request request) async {
+      if (request.url.path == '/saimulti/app/im/prepareUpload') {
+        return _apiSuccess(_preparePayload());
+      }
+      if (request.url.path == '/saimulti/app/im/upload') {
+        return _apiSuccess({
+          'file_id': _bFileId,
+          'kind': 'file',
+          'name': 'report.txt',
+          'size': 3,
+          'mime_type': 'application/octet-stream',
+          'extension': 'pdf',
+        });
+      }
+      if (request.url.path == '/saimulti/app/im/releaseUpload') {
+        releaseCount += 1;
+        return _apiSuccess({'released': false, 'state': 'confirmed'});
+      }
+      throw StateError('unexpected path ${request.url.path}');
+    }
+
+    final api = AppApiClient(
+      httpClient: MockClient(handleApi),
+      requestClientFactory: () => MockClient(handleApi),
+    );
+    final service = AppMediaService(api);
+    await expectLater(
+      service.upload(
+        tenant: tenantFixture(),
+        session: _session,
+        kind: AppMediaKind.file,
+        conversationType: 1,
+        conversationId: 'conversation-01',
+        filePath: file.path,
+        filename: 'report.txt',
+        size: 3,
+        mimeType: 'application/octet-stream',
+      ),
+      throwsFormatException,
+    );
+    expect(releaseCount, 0);
     service.close();
     api.close();
     await directory.delete(recursive: true);
@@ -408,25 +678,26 @@ void main() {
         );
     final uploadTransport = _ControlledRequestClient();
     var transportCount = 0;
+    var releaseCount = 0;
     http.Client createApiTransport() {
       transportCount += 1;
       if (transportCount == 1) {
         return MockClient(
-          (request) async => http.Response(
-            jsonEncode({
-              'code': 200,
-              'message': 'success',
-              'data': {
-                'mode': 'proxy',
-                'upload_path': '/saimulti/app/im/upload',
-                'method': 'POST',
-              },
-            }),
-            200,
+          (request) async => _apiSuccess(
+            _preparePayload(filename: 'secret.bin', extension: 'bin'),
           ),
         );
       }
-      return uploadTransport;
+      if (transportCount == 2) return uploadTransport;
+      if (transportCount == 3) {
+        return MockClient((request) async {
+          expect(request.url.path, '/saimulti/app/im/releaseUpload');
+          expect(jsonDecode(request.body), {'upload_id': _uploadId});
+          releaseCount += 1;
+          return _apiSuccess({'released': true, 'state': 'released'});
+        });
+      }
+      throw StateError('unexpected transport count $transportCount');
     }
 
     final api = AppApiClient(
@@ -454,6 +725,8 @@ void main() {
     registry.failClose();
     await expectLater(pending, throwsStateError);
     expect(uploadTransport.closeCalled, isTrue);
+    expect(releaseCount, 1);
+    expect(transportCount, 3);
     expect(
       uploadTransport.respond(
         http.Response(
@@ -546,6 +819,35 @@ void main() {
     api.close();
   });
 }
+
+Map<String, Object?> _preparePayload({
+  String filename = 'report.txt',
+  int size = 3,
+  String mimeType = 'application/octet-stream',
+  String extension = 'txt',
+}) => {
+  'mode': 'proxy',
+  'upload_path': '/saimulti/app/im/upload',
+  'method': 'POST',
+  'upload_id': _uploadId,
+  'expires_at': DateTime.now().millisecondsSinceEpoch ~/ 1000 + 300,
+  'filename': filename,
+  'size': size,
+  'mime_type': mimeType,
+  'extension': extension,
+};
+
+http.Response _apiSuccess(Object? data) => http.Response.bytes(
+  utf8.encode(jsonEncode({'code': 200, 'message': 'success', 'data': data})),
+  200,
+  headers: {'content-type': 'application/json; charset=utf-8'},
+);
+
+http.Response _apiFailure(String message) => http.Response.bytes(
+  utf8.encode(jsonEncode({'code': 500, 'message': message, 'data': null})),
+  500,
+  headers: {'content-type': 'application/json; charset=utf-8'},
+);
 
 GroupMemberAccessEntry _groupEntry(String version) =>
     GroupMemberAccessEntry.fromJson({
@@ -645,3 +947,5 @@ const _session = AppSession(
 
 const _aFileId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const _bFileId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const _uploadId =
+    'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
