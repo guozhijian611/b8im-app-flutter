@@ -234,6 +234,7 @@ Future<void> main() async {
     final page = await messaging.fetchMessages(
       tenant: tenant,
       session: session,
+      conversationType: 1,
       conversationId: sent.conversationId,
       limit: 100,
     );
@@ -277,6 +278,8 @@ Future<void> main() async {
       tenant: tenant,
       session: session,
       kind: AppMediaKind.image,
+      conversationType: 1,
+      conversationId: sent.conversationId,
       filePath: imageFile.path,
       filename: 'app-smoke.png',
       size: imageBytes.length,
@@ -307,8 +310,10 @@ Future<void> main() async {
       tenant: tenant,
       session: peerSession,
       fileId: pushedImage.assetFileId,
+      conversationType: 1,
       conversationId: pushedImage.conversationId,
       messageId: pushedImage.messageId,
+      messageSeq: pushedImage.messageSeq,
       filename: pushedImage.assetName,
     );
     if (!_bytesEqual(
@@ -322,6 +327,8 @@ Future<void> main() async {
       tenant: tenant,
       session: session,
       kind: AppMediaKind.file,
+      conversationType: 1,
+      conversationId: sent.conversationId,
       filePath: documentFile.path,
       filename: 'app-smoke.txt',
       size: documentBytes.length,
@@ -352,8 +359,10 @@ Future<void> main() async {
       tenant: tenant,
       session: peerSession,
       fileId: pushedFile.assetFileId,
+      conversationType: 1,
       conversationId: pushedFile.conversationId,
       messageId: pushedFile.messageId,
+      messageSeq: pushedFile.messageSeq,
       filename: pushedFile.assetName,
     );
     if (!_bytesEqual(
@@ -365,6 +374,7 @@ Future<void> main() async {
     final mediaHistory = await messaging.fetchMessages(
       tenant: tenant,
       session: peerSession,
+      conversationType: 1,
       conversationId: sent.conversationId,
       limit: 100,
     );
@@ -381,6 +391,7 @@ Future<void> main() async {
     await messaging.markRead(
       tenant: tenant,
       session: session,
+      conversationType: 1,
       conversationId: sent.conversationId,
     );
     final im = connection.bootstrap;

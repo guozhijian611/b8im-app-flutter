@@ -1,4 +1,5 @@
 import 'package:b8im_app_flutter/src/messaging/contact_display_label.dart';
+import 'package:b8im_app_flutter/src/im/group_member_access.dart';
 
 const Object _notProvided = Object();
 
@@ -1011,6 +1012,9 @@ final class AppImConversationSyncPage {
     required this.messagesHasMore,
     required this.changesHasMore,
     required this.crossOrgAccessSnapshotId,
+    required this.groupAccessSnapshotId,
+    required this.groupAccessVersion,
+    required this.groupAccessState,
   });
 
   factory AppImConversationSyncPage.fromJson(
@@ -1034,6 +1038,28 @@ final class AppImConversationSyncPage {
       throw const FormatException(
         'conversation SYNC_ACK cross_org_access_snapshot_id 无效',
       );
+    }
+    final groupSnapshotId = normalizeGroupAccessPositiveDecimal(
+      map['access_snapshot_id'],
+    );
+    if (groupSnapshotId.isEmpty) {
+      throw const FormatException(
+        'conversation SYNC_ACK access_snapshot_id 无效',
+      );
+    }
+    final groupVersion = identity.conversationType == 2
+        ? normalizeGroupAccessPositiveDecimal(map['access_version'])
+        : '';
+    final groupState = identity.conversationType == 2
+        ? map['access_state']
+        : null;
+    if ((identity.conversationType == 2 &&
+            (groupVersion.isEmpty ||
+                (groupState != 'active' && groupState != 'history_only'))) ||
+        (identity.conversationType != 2 &&
+            (map.containsKey('access_version') ||
+                map.containsKey('access_state')))) {
+      throw const FormatException('conversation SYNC_ACK 群访问 entry 无效');
     }
     final nextAfterMessageSeq = imInt(
       map,
@@ -1072,6 +1098,9 @@ final class AppImConversationSyncPage {
         'conversation sync.changes_has_more',
       ),
       crossOrgAccessSnapshotId: snapshotId,
+      groupAccessSnapshotId: groupSnapshotId,
+      groupAccessVersion: groupVersion,
+      groupAccessState: groupState as String?,
     );
   }
 
@@ -1083,6 +1112,9 @@ final class AppImConversationSyncPage {
   final bool messagesHasMore;
   final bool changesHasMore;
   final String crossOrgAccessSnapshotId;
+  final String groupAccessSnapshotId;
+  final String groupAccessVersion;
+  final String? groupAccessState;
 }
 
 final class AppImUserSummary {

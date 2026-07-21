@@ -8,11 +8,14 @@ import 'package:b8im_app_flutter/src/contacts/contacts_page.dart';
 import 'package:b8im_app_flutter/src/discovery/tenant_config.dart';
 import 'package:b8im_app_flutter/src/discovery/tenant_discovery_client.dart';
 import 'package:b8im_app_flutter/src/im/app_im_connection.dart';
+import 'package:b8im_app_flutter/src/im/group_member_access.dart';
 import 'package:b8im_app_flutter/src/media/app_media_picker.dart';
 import 'package:b8im_app_flutter/src/media/app_media_service.dart';
 import 'package:b8im_app_flutter/src/messaging/app_im_models.dart';
 import 'package:b8im_app_flutter/src/messaging/app_messaging_service.dart';
 import 'package:b8im_app_flutter/src/messaging/messaging_home_page.dart';
+import 'package:b8im_app_flutter/src/qr_login/app_qr_login_service.dart';
+import 'package:b8im_app_flutter/src/qr_login/web_login_qr_payload.dart';
 import 'package:b8im_app_flutter/src/session/app_session.dart';
 import 'package:b8im_app_flutter/src/session/app_session_bootstrapper.dart';
 import 'package:flutter/material.dart';
@@ -89,7 +92,30 @@ final class _FakeSessionBootstrap implements AppSessionBootstrapGateway {
 }
 
 final class _FakeImRuntime implements AppImRuntime {
-  _FakeImRuntime({this.conversationSync, this.acknowledgeBarrier});
+  _FakeImRuntime({this.conversationSync, this.acknowledgeBarrier}) {
+    _groupAccess.replace(
+      GroupMemberAccessSnapshot(
+        snapshotId: '1',
+        entries: {
+          'group-01': GroupMemberAccessEntry(
+            conversationId: 'group-01',
+            accessVersion: '1',
+            accessState: GroupMemberAccessState.active,
+            lastMessageSeq: '100',
+            lastChangeSeq: '100',
+            periods: const [
+              GroupMemberAccessPeriod(periodNo: '1', fromSeq: '1', toSeq: null),
+            ],
+          ),
+        },
+      ),
+    );
+  }
+
+  final GroupMemberAccessRegistry _groupAccess = GroupMemberAccessRegistry(
+    organization: 1,
+    userId: 'user-01',
+  );
 
   final Future<AppImConversationSyncPage> Function(
     String conversationId,
@@ -102,6 +128,7 @@ final class _FakeImRuntime implements AppImRuntime {
     sync: true,
   );
   bool closed = false;
+  AppImConnectionStatus _status = AppImConnectionStatus.connected;
   int _nextChangeSeq = 1;
   final List<({String messageId, AppImDeliveryStatus status})>
   acknowledgements = [];
@@ -116,6 +143,7 @@ final class _FakeImRuntime implements AppImRuntime {
     credentialSessionId: 'credential-01',
     crossOrgAccessSnapshotId: '1',
     highestCrossOrgAccessSnapshotId: '1',
+    groupAccessSnapshotId: '1',
     previousGlobalSeq: '0',
     nextGlobalSeq: '7',
     syncedMessages: [],
@@ -128,11 +156,45 @@ final class _FakeImRuntime implements AppImRuntime {
   List<AppImConversationAccessChanged> get recentAccessChanges => const [];
 
   @override
-  bool get isConnected => !closed;
+  bool get isConnected => !closed && _status == AppImConnectionStatus.connected;
 
   @override
-  AppImConnectionStatus get connectionStatus =>
-      closed ? AppImConnectionStatus.closed : AppImConnectionStatus.connected;
+  GroupMemberAccessSnapshot? get groupAccessSnapshot => _groupAccess.snapshot;
+
+  @override
+  bool get isGroupAccessReady => _groupAccess.isReady;
+
+  @override
+  AppImConnectionStatus get connectionStatus => _status;
+
+  Future<void> publishGroupSnapshot(GroupMemberAccessSnapshot snapshot) async {
+    final previous = _groupAccess.snapshot;
+    await _groupAccess.replace(snapshot);
+    controller.add(
+      AppImEvent(
+        command: groupMemberAccessSnapshotAckCommand,
+        message: null,
+        eventId: null,
+        previousGroupAccessSnapshot: previous,
+        groupAccessSnapshot: snapshot,
+      ),
+    );
+  }
+
+  void emitConnectionStatus(AppImConnectionStatus status) {
+    _status = status;
+    if (status != AppImConnectionStatus.connected) {
+      _groupAccess.failClose();
+    }
+    controller.add(
+      AppImEvent(
+        command: 'connection_status',
+        message: null,
+        eventId: null,
+        connectionStatus: status,
+      ),
+    );
+  }
 
   @override
   void registerConversationIdentities(
@@ -214,6 +276,9 @@ final class _FakeImRuntime implements AppImRuntime {
       messagesHasMore: false,
       changesHasMore: false,
       crossOrgAccessSnapshotId: '1',
+      groupAccessSnapshotId: '1',
+      groupAccessVersion: identity.conversationType == 2 ? '1' : '',
+      groupAccessState: identity.conversationType == 2 ? 'active' : null,
     );
   }
 
@@ -309,6 +374,7 @@ final class _FakeImRuntime implements AppImRuntime {
   @override
   Future<void> close() async {
     closed = true;
+    _status = AppImConnectionStatus.closed;
     await controller.close();
   }
 }
@@ -345,6 +411,7 @@ final class _FakeMessaging implements AppMessagingGateway {
   Future<AppImMessagePage> fetchMessages({
     required TenantConfig tenant,
     required AppSession session,
+    required int conversationType,
     required String conversationId,
     int peerOrganization = 0,
     String peerUserId = '',
@@ -361,52 +428,67 @@ final class _FakeMessaging implements AppMessagingGateway {
   Future<int> markRead({
     required TenantConfig tenant,
     required AppSession session,
+    required int conversationType,
     required String conversationId,
   }) async => 1;
 }
 
 final class _FakeGroupMessaging implements AppMessagingGateway {
+  _FakeGroupMessaging({List<AppImMessage>? messages})
+    : messages = messages ?? [_groupMessage()];
+
+  final List<AppImMessage> messages;
+  bool failFetch = false;
+
   @override
   Future<List<AppImConversation>> fetchConversations({
     required TenantConfig tenant,
     required AppSession session,
-  }) async => const [
-    AppImConversation(
-      conversationId: 'group-01',
-      conversationType: 2,
-      title: '测试群聊',
-      peerUser: null,
-      lastMessageId: 'group-message-01',
-      lastMessageSeq: 1,
-      lastMessageSummary: '群消息',
-      lastMessageTime: '2026-07-16 21:00:00',
-      unreadCount: 0,
-      isPinned: false,
-      isMuted: false,
-      avatarUrl: '',
-    ),
-  ];
+  }) async {
+    if (failFetch) throw StateError('authoritative group refresh failed');
+    return const [
+      AppImConversation(
+        conversationId: 'group-01',
+        conversationType: 2,
+        title: '测试群聊',
+        peerUser: null,
+        lastMessageId: 'group-message-01',
+        lastMessageSeq: 1,
+        lastMessageSummary: '群消息',
+        lastMessageTime: '2026-07-16 21:00:00',
+        unreadCount: 0,
+        isPinned: false,
+        isMuted: false,
+        avatarUrl: '',
+      ),
+    ];
+  }
 
   @override
   Future<AppImMessagePage> fetchMessages({
     required TenantConfig tenant,
     required AppSession session,
+    required int conversationType,
     required String conversationId,
     int peerOrganization = 0,
     String peerUserId = '',
     int beforeSeq = 0,
     int limit = 50,
-  }) async => AppImMessagePage(
-    messages: [_groupMessage()],
-    nextAfterSeq: 1,
-    nextBeforeSeq: 1,
-    hasMoreBefore: false,
-  );
+  }) async {
+    if (failFetch) throw StateError('authoritative group refresh failed');
+    return AppImMessagePage(
+      messages: messages,
+      nextAfterSeq: messages.isEmpty ? 0 : messages.last.messageSeq,
+      nextBeforeSeq: messages.isEmpty ? 0 : messages.first.messageSeq,
+      hasMoreBefore: false,
+    );
+  }
 
   @override
   Future<int> markRead({
     required TenantConfig tenant,
     required AppSession session,
+    required int conversationType,
     required String conversationId,
   }) async => 1;
 }
@@ -427,6 +509,7 @@ final class _GapMessaging implements AppMessagingGateway {
   Future<AppImMessagePage> fetchMessages({
     required TenantConfig tenant,
     required AppSession session,
+    required int conversationType,
     required String conversationId,
     int peerOrganization = 0,
     String peerUserId = '',
@@ -456,6 +539,7 @@ final class _GapMessaging implements AppMessagingGateway {
   Future<int> markRead({
     required TenantConfig tenant,
     required AppSession session,
+    required int conversationType,
     required String conversationId,
   }) async => 0;
 }
@@ -478,6 +562,7 @@ final class _CrossOrgMessaging implements AppMessagingGateway {
   Future<AppImMessagePage> fetchMessages({
     required TenantConfig tenant,
     required AppSession session,
+    required int conversationType,
     required String conversationId,
     int peerOrganization = 0,
     String peerUserId = '',
@@ -498,6 +583,7 @@ final class _CrossOrgMessaging implements AppMessagingGateway {
   Future<int> markRead({
     required TenantConfig tenant,
     required AppSession session,
+    required int conversationType,
     required String conversationId,
   }) async {
     markReadCount += 1;
@@ -511,8 +597,10 @@ final class _UnusedMedia implements AppMediaGateway {
     required TenantConfig tenant,
     required AppSession session,
     required String fileId,
+    required int conversationType,
     required String conversationId,
     required String messageId,
+    required int messageSeq,
     required String filename,
   }) => throw UnimplementedError();
 
@@ -521,8 +609,10 @@ final class _UnusedMedia implements AppMediaGateway {
     required TenantConfig tenant,
     required AppSession session,
     required String fileId,
+    required int conversationType,
     required String conversationId,
     required String messageId,
+    required int messageSeq,
   }) => throw UnimplementedError();
 
   @override
@@ -530,10 +620,28 @@ final class _UnusedMedia implements AppMediaGateway {
     required TenantConfig tenant,
     required AppSession session,
     required AppMediaKind kind,
+    required int conversationType,
+    required String conversationId,
     required String filePath,
     required String filename,
     required int size,
     required String mimeType,
+  }) => throw UnimplementedError();
+}
+
+final class _UnusedQrLogin implements AppQrLoginGateway {
+  @override
+  Future<WebLoginScanResult> scan({
+    required TenantConfig tenant,
+    required AppSession session,
+    required WebLoginQrPayload payload,
+  }) => throw UnimplementedError();
+
+  @override
+  Future<void> confirm({
+    required TenantConfig tenant,
+    required AppSession session,
+    required String qrId,
   }) => throw UnimplementedError();
 }
 
@@ -695,6 +803,27 @@ AppImMessage _groupMessage() => const AppImMessage(
   deliveryStatus: AppImDeliveryStatus.sent,
 );
 
+AppImMessage _groupMessageAt(int sequence, String text) => AppImMessage(
+  organization: 1,
+  globalSeq: '$sequence',
+  conversationId: 'group-01',
+  conversationType: 2,
+  messageId: 'group-message-$sequence',
+  messageSeq: sequence,
+  clientMsgId: 'group-client-$sequence',
+  senderOrganization: 1,
+  senderId: 'user-01',
+  senderUser: null,
+  messageType: 1,
+  content: {'text': text},
+  status: 'normal',
+  editTime: '',
+  editCount: 0,
+  createTime: '2026-07-16 21:00:00',
+  updateTime: '2026-07-16 21:00:00',
+  deliveryStatus: AppImDeliveryStatus.sent,
+);
+
 AppImMessage _crossOrgMessage(int index) => AppImMessage(
   organization: 1,
   globalSeq: '${index + 1}',
@@ -731,6 +860,21 @@ const _singleConversation = AppImConversation(
   lastMessageSeq: 1,
   lastMessageSummary: '变更前',
   lastMessageTime: '2026-07-20 12:00:00',
+  unreadCount: 0,
+  isPinned: false,
+  isMuted: false,
+  avatarUrl: '',
+);
+
+const _groupConversation = AppImConversation(
+  conversationId: 'group-01',
+  conversationType: 2,
+  title: '测试群聊',
+  peerUser: null,
+  lastMessageId: 'group-message-01',
+  lastMessageSeq: 1,
+  lastMessageSummary: '群消息',
+  lastMessageTime: '2026-07-16 21:00:00',
   unreadCount: 0,
   isPinned: false,
   isMuted: false,
@@ -1163,6 +1307,221 @@ void main() {
 
     expect(find.text('已发送'), findsOneWidget);
     expect(find.text('已读'), findsNothing);
+
+    im.controller.add(
+      const AppImEvent(
+        command: groupMemberAccessChangedCommand,
+        message: null,
+        eventId: 'group-history-only',
+        groupAccessChanged: GroupMemberAccessChanged(
+          eventId: 'group-history-only',
+          snapshotId: '2',
+          entry: GroupMemberAccessEntry(
+            conversationId: 'group-01',
+            accessVersion: '2',
+            accessState: GroupMemberAccessState.historyOnly,
+            lastMessageSeq: '1',
+            lastChangeSeq: '1',
+            periods: [
+              GroupMemberAccessPeriod(periodNo: '1', fromSeq: '1', toSeq: '1'),
+            ],
+          ),
+          reason: 'leave',
+          changedAt: '2026-07-20 12:00:01',
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.text('群消息'), findsOneWidget);
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const ValueKey('message-composer')))
+          .enabled,
+      isFalse,
+    );
+
+    im.controller.add(
+      const AppImEvent(
+        command: groupMemberAccessChangedCommand,
+        message: null,
+        eventId: 'group-revoked',
+        groupAccessChanged: GroupMemberAccessChanged(
+          eventId: 'group-revoked',
+          snapshotId: '3',
+          entry: GroupMemberAccessEntry(
+            conversationId: 'group-01',
+            accessVersion: '3',
+            accessState: GroupMemberAccessState.revoked,
+            lastMessageSeq: '1',
+            lastChangeSeq: '1',
+            periods: [],
+          ),
+          reason: 'history_revoke',
+          changedAt: '2026-07-20 12:00:02',
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.text('群消息'), findsNothing);
+    expect(find.text('群会话访问已撤销'), findsOneWidget);
+  });
+
+  testWidgets('群快照撤权在会话列表 HTTP 失败前同步清除', (tester) async {
+    final im = _FakeImRuntime();
+    final tenant = tenantFixture();
+    final messaging = _FakeGroupMessaging();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MessagingHomePage(
+          tenant: tenant,
+          session: _testSession(tenant),
+          im: im,
+          messaging: messaging,
+          media: _UnusedMedia(),
+          mediaPicker: _UnusedMediaPicker(),
+          qrLogin: _UnusedQrLogin(),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('测试群聊'), findsOneWidget);
+
+    messaging.failFetch = true;
+    await im.publishGroupSnapshot(
+      GroupMemberAccessSnapshot(snapshotId: '2', entries: const {}),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('测试群聊'), findsNothing);
+    expect(
+      find.textContaining('authoritative group refresh failed'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('history_only 快照先裁剪周期外消息，HTTP 失败也不复活', (tester) async {
+    final im = _FakeImRuntime();
+    final tenant = tenantFixture();
+    final messaging = _FakeGroupMessaging(
+      messages: [_groupMessageAt(1, '保留的群消息'), _groupMessageAt(15, '必须裁剪的群消息')],
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ConversationPage(
+          tenant: tenant,
+          session: _testSession(tenant),
+          im: im,
+          messaging: messaging,
+          conversation: _groupConversation,
+          media: _UnusedMedia(),
+          mediaPicker: _UnusedMediaPicker(),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('保留的群消息'), findsOneWidget);
+    expect(find.text('必须裁剪的群消息'), findsOneWidget);
+
+    messaging.failFetch = true;
+    await im.publishGroupSnapshot(
+      GroupMemberAccessSnapshot(
+        snapshotId: '2',
+        entries: {
+          'group-01': GroupMemberAccessEntry(
+            conversationId: 'group-01',
+            accessVersion: '2',
+            accessState: GroupMemberAccessState.historyOnly,
+            lastMessageSeq: '15',
+            lastChangeSeq: '101',
+            periods: const [
+              GroupMemberAccessPeriod(periodNo: '1', fromSeq: '1', toSeq: '10'),
+            ],
+          ),
+        },
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('保留的群消息'), findsOneWidget);
+    expect(find.text('必须裁剪的群消息'), findsNothing);
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const ValueKey('message-composer')))
+          .enabled,
+      isFalse,
+    );
+    expect(
+      find.textContaining('authoritative group refresh failed'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('群 reconnect 新 active 快照补充失败时仍保持 fail-closed', (tester) async {
+    final im = _FakeImRuntime();
+    final tenant = tenantFixture();
+    final messaging = _FakeGroupMessaging();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ConversationPage(
+          tenant: tenant,
+          session: _testSession(tenant),
+          im: im,
+          messaging: messaging,
+          conversation: _groupConversation,
+          media: _UnusedMedia(),
+          mediaPicker: _UnusedMediaPicker(),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const ValueKey('message-composer')),
+      '不应跨重连保留',
+    );
+
+    im.emitConnectionStatus(AppImConnectionStatus.reconnecting);
+    await tester.pump();
+    expect(find.text('群消息'), findsNothing);
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const ValueKey('message-composer')))
+          .controller
+          ?.text,
+      isEmpty,
+    );
+
+    messaging.failFetch = true;
+    await im.publishGroupSnapshot(
+      GroupMemberAccessSnapshot(
+        snapshotId: '2',
+        entries: {
+          'group-01': GroupMemberAccessEntry(
+            conversationId: 'group-01',
+            accessVersion: '2',
+            accessState: GroupMemberAccessState.active,
+            lastMessageSeq: '100',
+            lastChangeSeq: '101',
+            periods: const [
+              GroupMemberAccessPeriod(periodNo: '1', fromSeq: '1', toSeq: null),
+            ],
+          ),
+        },
+      ),
+    );
+    im.emitConnectionStatus(AppImConnectionStatus.connected);
+    await tester.pumpAndSettle();
+
+    expect(find.text('群消息'), findsNothing);
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const ValueKey('message-composer')))
+          .enabled,
+      isFalse,
+    );
+    expect(
+      find.textContaining('authoritative group refresh failed'),
+      findsOneWidget,
+    );
   });
 
   testWidgets('conversation_read 目标不在 50 条缓存时仍按已验证 seq 推进', (tester) async {
@@ -1236,6 +1595,9 @@ void main() {
                 messagesHasMore: false,
                 changesHasMore: false,
                 crossOrgAccessSnapshotId: '1',
+                groupAccessSnapshotId: '1',
+                groupAccessVersion: '',
+                groupAccessState: null,
               ),
     );
     final tenant = tenantFixture();

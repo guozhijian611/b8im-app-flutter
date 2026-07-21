@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:b8im_app_flutter/src/im/app_im_connection.dart';
+import 'package:b8im_app_flutter/src/im/group_member_access.dart';
 import 'package:b8im_app_flutter/src/im/im_socket.dart';
 import 'package:b8im_app_flutter/src/messaging/app_im_models.dart';
 import 'package:b8im_app_flutter/src/network/app_api_client.dart';
@@ -921,6 +922,171 @@ void main() {
     harness.api.close();
   });
 
+  test('群请求等待 ACK 期间撤权使 pending 结果失效', () async {
+    final groupAccess = GroupMemberAccessRegistry(
+      organization: 1,
+      userId: 'user-01',
+    );
+    final socket = _MessagingSocket(
+      deferScreenshotAck: true,
+      groupAccessConversationId: 'conversation-01',
+    );
+    final harness = await _connectSocket(socket, groupAccess: groupAccess);
+
+    final pending = harness.connection.sendScreenshot(_groupIdentity);
+    expect(socket.screenshotRequestCount, 1);
+    groupAccess.failClose();
+    socket.completeScreenshot();
+
+    await expectLater(pending, throwsStateError);
+    await harness.connection.close();
+    harness.api.close();
+  });
+
+  test('所有群命令在真实 ACK 交错中由请求期 access epoch 失效', () async {
+    final groupAccess = GroupMemberAccessRegistry(
+      organization: 1,
+      userId: 'user-01',
+    );
+    final socket = _MessagingSocket(
+      syncSenderId: 'user-01',
+      syncConversationType: 2,
+      groupAccessConversationId: 'conversation-01',
+    );
+    final harness = await _connectSocket(socket, groupAccess: groupAccess);
+    final ownMessage = harness.connection.bootstrap.syncedMessages.single;
+    final snapshot = groupAccess.snapshot!;
+    final sideEffects = <AppImEvent>[];
+    final subscription = harness.connection.events.listen(sideEffects.add);
+
+    Future<void> exercise(
+      String command,
+      Future<Object?> Function() request,
+    ) async {
+      socket.deferCommand(command);
+      final pending = request();
+      expect(socket.hasDeferredCommand(command), isTrue);
+      groupAccess.failClose();
+      socket.completeDeferredCommand(command);
+      await expectLater(pending, throwsStateError);
+      expect(sideEffects, isEmpty);
+      await groupAccess.replace(snapshot);
+      expect(groupAccess.isReady, isTrue);
+    }
+
+    await exercise(
+      'send',
+      () => harness.connection.sendText(
+        conversationType: 2,
+        conversationId: 'conversation-01',
+        text: 'epoch guarded',
+      ),
+    );
+    await exercise(
+      'ack',
+      () => harness.connection.acknowledge(
+        message: ownMessage,
+        status: AppImDeliveryStatus.read,
+        identity: _groupIdentity,
+      ),
+    );
+    await exercise(
+      'conversation_read',
+      () => harness.connection.markConversationRead(
+        identity: _groupIdentity,
+        lastReadMessage: ownMessage,
+      ),
+    );
+    await exercise(
+      'sync',
+      () => harness.connection.syncConversation(
+        identity: _groupIdentity,
+        afterMessageSeq: 0,
+        afterChangeSeq: 0,
+      ),
+    );
+    await exercise(
+      'recall',
+      () => harness.connection.recallMessage(
+        ownMessage,
+        identity: _groupIdentity,
+      ),
+    );
+    await exercise(
+      'edit',
+      () => harness.connection.editMessage(
+        ownMessage,
+        'epoch guarded edit',
+        identity: _groupIdentity,
+      ),
+    );
+    await exercise(
+      'delete',
+      () => harness.connection.deleteMessage(
+        ownMessage,
+        scope: 'self',
+        identity: _groupIdentity,
+      ),
+    );
+
+    await subscription.cancel();
+    await harness.connection.close();
+    harness.api.close();
+  });
+
+  test('重新入群周期 gap PUSH 不投递且触发权威快照恢复', () async {
+    final socket = _MessagingSocket(
+      groupAccessConversationId: 'conversation-01',
+      groupAccessPeriods: const [
+        {'period_no': '1', 'from_seq': '1', 'to_seq': '10'},
+        {'period_no': '2', 'from_seq': '20', 'to_seq': null},
+      ],
+    );
+    final harness = await _connectSocket(socket);
+    final uiMessages = <AppImMessage>[];
+    var deliveryAckConsumerRuns = 0;
+    final consumerErrors = <Object>[];
+    final subscription = harness.connection.events.listen((event) {
+      if (event.command == 'push' && event.message != null) {
+        deliveryAckConsumerRuns += 1;
+        uiMessages.add(event.message!);
+        unawaited(
+          harness.connection
+              .acknowledge(
+                message: event.message!,
+                status: AppImDeliveryStatus.delivered,
+                identity: _groupIdentity,
+              )
+              .then<void>(
+                (_) {},
+                onError: (Object error, StackTrace _) {
+                  consumerErrors.add(error);
+                },
+              ),
+        );
+      }
+    });
+
+    socket.pushGroupMessage(messageSeq: 15);
+    for (
+      var index = 0;
+      index < 50 && socket.groupSnapshotRequestCount < 2;
+      index++
+    ) {
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+    }
+
+    expect(deliveryAckConsumerRuns, 0);
+    expect(uiMessages, isEmpty);
+    expect(consumerErrors, isEmpty);
+    expect(socket.groupSnapshotRequestCount, greaterThanOrEqualTo(2));
+    expect(socket.commands.where((command) => command == 'ack'), isEmpty);
+    expect(harness.connection.isGroupAccessReady, isTrue);
+    await subscription.cancel();
+    await harness.connection.close();
+    harness.api.close();
+  });
+
   test('控制 ACK 必须绑定当前 actor 复合身份', () async {
     final socket = _MessagingSocket(
       syncSenderId: 'user-01',
@@ -1503,6 +1669,7 @@ void main() {
         authAccessSnapshotId: '99',
         accessSnapshotId: '99',
         syncConversationType: 2,
+        groupAccessConversationId: 'conversation-01',
       ),
       cursor: cursor,
     );
@@ -1856,11 +2023,268 @@ void main() {
     await harness.connection.close();
     harness.api.close();
   });
+
+  test('reconnect 拒绝旧群快照并只发布已提交 previous 到 next', () async {
+    final first = _MessagingSocket(
+      clientId: 'group-client-05',
+      groupAccessSnapshotId: '5',
+      groupAccessVersion: '7',
+    );
+    final stale = _MessagingSocket(
+      clientId: 'group-client-04',
+      groupAccessSnapshotId: '4',
+      groupAccessVersion: '8',
+    );
+    final next = _MessagingSocket(
+      clientId: 'group-client-06',
+      groupAccessSnapshotId: '6',
+      groupAccessVersion: '8',
+    );
+    final harness = await _connectRuntime([first, stale, next]);
+    final snapshotCommitted = Completer<AppImEvent>();
+    final subscription = harness.runtime.events.listen((event) {
+      if (event.groupAccessSnapshot?.snapshotId == '6' &&
+          !snapshotCommitted.isCompleted) {
+        snapshotCommitted.complete(event);
+      }
+    }, onError: (_) {});
+
+    await first.remoteClose();
+    final event = await snapshotCommitted.future.timeout(
+      const Duration(seconds: 2),
+    );
+
+    expect(event.previousGroupAccessSnapshot?.snapshotId, '5');
+    expect(event.groupAccessSnapshot?.snapshotId, '6');
+    expect(harness.runtime.bootstrap.clientId, 'group-client-06');
+    expect(harness.runtime.isGroupAccessReady, isTrue);
+    expect(stale.groupSnapshotRequestCount, greaterThanOrEqualTo(1));
+    expect(stale.closed, isTrue);
+
+    await subscription.cancel();
+    await harness.runtime.close();
+    harness.api.close();
+  });
+
+  test('出站 ACK/read/recall/edit/delete 必须命中具体群访问周期', () async {
+    final socket = _MessagingSocket(
+      syncSenderId: 'user-01',
+      syncConversationType: 2,
+      groupAccessConversationId: 'conversation-01',
+      groupAccessPeriods: const [
+        {'period_no': '1', 'from_seq': '1', 'to_seq': '10'},
+        {'period_no': '2', 'from_seq': '20', 'to_seq': null},
+      ],
+    );
+    final harness = await _connectSocket(socket);
+    final inaccessible = AppImMessage.fromRealtime(
+      _message(
+        messageId: 'message-15',
+        clientMsgId: 'local-15',
+        messageSeq: 15,
+        globalSeq: '15',
+        senderId: 'user-01',
+        conversationType: 2,
+        text: 'period gap',
+      ),
+    );
+    final cases = <(String, Future<Object?> Function())>[
+      (
+        'ack',
+        () => harness.connection.acknowledge(
+          message: inaccessible,
+          status: AppImDeliveryStatus.read,
+          identity: _groupIdentity,
+        ),
+      ),
+      (
+        'conversation_read',
+        () => harness.connection.markConversationRead(
+          identity: _groupIdentity,
+          lastReadMessage: inaccessible,
+        ),
+      ),
+      (
+        'recall',
+        () => harness.connection.recallMessage(
+          inaccessible,
+          identity: _groupIdentity,
+        ),
+      ),
+      (
+        'edit',
+        () => harness.connection.editMessage(
+          inaccessible,
+          'still inaccessible',
+          identity: _groupIdentity,
+        ),
+      ),
+      (
+        'delete',
+        () => harness.connection.deleteMessage(
+          inaccessible,
+          scope: 'self',
+          identity: _groupIdentity,
+        ),
+      ),
+    ];
+    for (final (command, request) in cases) {
+      final before = socket.commands.where((item) => item == command).length;
+      await expectLater(request(), throwsStateError);
+      expect(socket.commands.where((item) => item == command).length, before);
+    }
+
+    await harness.connection.close();
+    harness.api.close();
+  });
+
+  test('入站 receipt/read/mutation 周期 gap 不投递并触发快照恢复', () async {
+    for (final command in const [
+      'ack',
+      'conversation_read',
+      'recall',
+      'edit',
+      'delete',
+    ]) {
+      final socket = _MessagingSocket(
+        groupAccessConversationId: 'conversation-01',
+        groupAccessPeriods: const [
+          {'period_no': '1', 'from_seq': '1', 'to_seq': '10'},
+          {'period_no': '2', 'from_seq': '20', 'to_seq': null},
+        ],
+      );
+      final harness = await _connectSocket(socket);
+      harness.connection.registerConversationIdentities([_groupIdentity]);
+      final received = <AppImEvent>[];
+      final subscription = harness.connection.events.listen(
+        received.add,
+        onError: (_) {},
+      );
+
+      socket.pushRaw(_orderedGroupPacket(command, messageSeq: 15));
+      for (
+        var index = 0;
+        index < 100 && socket.groupSnapshotRequestCount < 2;
+        index += 1
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 2));
+      }
+
+      expect(
+        received.where((event) => event.command == command),
+        isEmpty,
+        reason: command,
+      );
+      expect(
+        socket.groupSnapshotRequestCount,
+        greaterThanOrEqualTo(2),
+        reason: command,
+      );
+      expect(harness.connection.isGroupAccessReady, isTrue);
+      await subscription.cancel();
+      await harness.connection.close();
+      harness.api.close();
+    }
+  });
+
+  test('入站群有序事件非法 message_seq 直接失败关闭', () async {
+    final groupAccess = GroupMemberAccessRegistry(
+      organization: 1,
+      userId: 'user-01',
+    );
+    final socket = _MessagingSocket(
+      groupAccessConversationId: 'conversation-01',
+    );
+    final harness = await _connectSocket(socket, groupAccess: groupAccess);
+    harness.connection.registerConversationIdentities([_groupIdentity]);
+    final error = Completer<Object>();
+    final subscription = harness.connection.events.listen(
+      (_) {},
+      onError: (Object value) {
+        if (!error.isCompleted) error.complete(value);
+      },
+    );
+
+    socket.pushRaw(_orderedGroupPacket('ack', messageSeq: 0));
+    expect(
+      await error.future.timeout(const Duration(seconds: 2)),
+      isA<FormatException>(),
+    );
+    for (
+      var index = 0;
+      index < 100 && (harness.connection.isConnected || groupAccess.isReady);
+      index += 1
+    ) {
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+    }
+    expect(harness.connection.isConnected, isFalse);
+    expect(groupAccess.isReady, isFalse);
+
+    await subscription.cancel();
+    harness.api.close();
+  });
+}
+
+Future<({AppImRuntime runtime, AppApiClient api})> _connectRuntime(
+  List<_MessagingSocket> sockets,
+) async {
+  final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+  final api = AppApiClient(
+    httpClient: MockClient((request) async {
+      final body = jsonDecode(request.body) as Map<String, Object?>;
+      final clientId = body['client_id']! as String;
+      return http.Response(
+        jsonEncode({
+          'code': 200,
+          'message': 'success',
+          'data': {
+            'token': _jwt({
+              'iss': 'b8im-test',
+              'aud': 'im',
+              'deployment_id': 'b8im-test',
+              'organization': 1,
+              'user_id': 'user-01',
+              'device_id': 'device-01',
+              'client_id': clientId,
+              'client_family': 'app',
+              'os': 'ios',
+              'session_id': 'abcdef0123456789abcdef0123456789',
+              'exp': now + 60,
+            }),
+          },
+        }),
+        200,
+      );
+    }),
+  );
+  final session = AppSession(
+    accessToken: 'access-token',
+    expireAt: now + 600,
+    organization: 1,
+    deploymentId: 'b8im-test',
+    deviceId: 'device-01',
+    runtime: const AppClientRuntime(os: 'ios'),
+    user: const AppUser(
+      id: '9',
+      userId: 'user-01',
+      account: 'acceptance',
+      nickname: '验收用户',
+    ),
+  );
+  final runtime = await AppImConnector(
+    sessionService: AppSessionService(api),
+    cursorStore: _MemoryCursor('0'),
+    socketFactory: (_) async => sockets.removeAt(0),
+    reconnectDelays: const [Duration.zero],
+    sleep: (_) async {},
+  ).connect(tenant: tenantFixture(), session: session);
+  return (runtime: runtime, api: api);
 }
 
 Future<({AppImConnection connection, AppApiClient api})> _connectSocket(
   _MessagingSocket socket, {
   _MemoryCursor? cursor,
+  GroupMemberAccessRegistry? groupAccess,
 }) async {
   final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
   final api = AppApiClient(
@@ -1909,6 +2333,7 @@ Future<({AppImConnection connection, AppApiClient api})> _connectSocket(
     sessionService: AppSessionService(api),
     cursorStore: cursor ?? _MemoryCursor('0'),
     socketFactory: (_) async => socket,
+    groupAccess: groupAccess,
   );
   return (connection: connection, api: api);
 }
@@ -2018,6 +2443,12 @@ final class _MessagingSocket implements ImSocket {
     this.syncMessageGlobalSeqOverride,
     this.screenshotEnabled = false,
     this.emitWrongGlobalSyncClientIdFirst = false,
+    this.groupAccessPeriods = const [
+      {'period_no': '1', 'from_seq': '1', 'to_seq': null},
+    ],
+    this.groupAccessSnapshotId = '1',
+    this.groupAccessVersion = '1',
+    this.groupAccessConversationId = 'group-01',
   }) {
     _controller.add(
       jsonEncode({
@@ -2051,12 +2482,20 @@ final class _MessagingSocket implements ImSocket {
   final String? syncMessageGlobalSeqOverride;
   final bool screenshotEnabled;
   final bool emitWrongGlobalSyncClientIdFirst;
+  final List<Map<String, Object?>> groupAccessPeriods;
+  final String groupAccessSnapshotId;
+  final String groupAccessVersion;
+  final String groupAccessConversationId;
   final StreamController<Object?> _controller = StreamController();
   final List<String> commands = [];
   Map<String, Object?>? _pendingScreenshotPacket;
   int screenshotRequestCount = 0;
+  int groupSnapshotRequestCount = 0;
   int globalSyncRequestCount = 0;
   final List<String> syncRequestIds = [];
+  final Set<String> _deferredCommands = {};
+  final Map<String, Map<String, Object?>> _deferredPackets = {};
+  bool _completingDeferred = false;
   bool closed = false;
 
   @override
@@ -2066,7 +2505,16 @@ final class _MessagingSocket implements ImSocket {
   void send(Object? value) {
     final packet = jsonDecode(value! as String) as Map<String, Object?>;
     final command = packet['cmd']! as String;
-    if (command != 'ping') commands.add(command);
+    if (command != 'ping' && command != 'group_member_access_snapshot') {
+      commands.add(command);
+    }
+    if (!_completingDeferred && _deferredCommands.contains(command)) {
+      if (_deferredPackets.containsKey(command)) {
+        throw StateError('duplicate deferred command: $command');
+      }
+      _deferredPackets[command] = packet;
+      return;
+    }
     switch (command) {
       case 'auth':
         _controller.add(
@@ -2084,6 +2532,33 @@ final class _MessagingSocket implements ImSocket {
               'os': 'ios',
               'cross_org_access_snapshot_id':
                   authAccessSnapshotId ?? accessSnapshotId,
+              'access_snapshot_id': groupAccessSnapshotId,
+            },
+          }),
+        );
+      case 'group_member_access_snapshot':
+        groupSnapshotRequestCount += 1;
+        final requestId = packet['client_msg_id']! as String;
+        _controller.add(
+          jsonEncode({
+            'cmd': 'group_member_access_snapshot_ack',
+            'organization': 1,
+            'client_msg_id': requestId,
+            'data': {
+              'access_snapshot_id': groupAccessSnapshotId,
+              'entries': [
+                {
+                  'conversation_id': groupAccessConversationId,
+                  'conversation_type': 2,
+                  'access_version': groupAccessVersion,
+                  'access_state': 'active',
+                  'last_message_seq': '100',
+                  'last_change_seq': '100',
+                  'periods': groupAccessPeriods,
+                },
+              ],
+              'next_cursor': null,
+              'has_more': false,
             },
           }),
         );
@@ -2137,6 +2612,11 @@ final class _MessagingSocket implements ImSocket {
                 'messages_has_more': false,
                 'changes_has_more': false,
                 'cross_org_access_snapshot_id': accessSnapshotId,
+                'access_snapshot_id': groupAccessSnapshotId,
+                if (requestData.containsKey('access_version'))
+                  'access_version': requestData['access_version'],
+                if (requestData.containsKey('access_version'))
+                  'access_state': 'active',
               },
             }),
           );
@@ -2201,6 +2681,7 @@ final class _MessagingSocket implements ImSocket {
                 'next_after_global_seq': '999',
                 'has_more': false,
                 'cross_org_access_snapshot_id': '999',
+                'access_snapshot_id': groupAccessSnapshotId,
               },
             }),
           );
@@ -2230,13 +2711,19 @@ final class _MessagingSocket implements ImSocket {
               'next_after_global_seq': '${page.globalSeq}',
               'has_more': page.hasMore,
               'cross_org_access_snapshot_id': page.snapshotId,
+              'access_snapshot_id': groupAccessSnapshotId,
             },
           }),
         );
       case 'send':
         final clientMsgId = packet['client_msg_id']! as String;
         final data = packet['data']! as Map<String, Object?>;
-        expect(data['to_organization'], 1);
+        final conversationType = data['conversation_type']! as int;
+        if (conversationType == 1) {
+          expect(data['to_organization'], 1);
+        } else {
+          expect(data['conversation_id'], 'conversation-01');
+        }
         final content = data['content']! as Map<String, Object?>;
         final messageType = data['message_type']! as int;
         _controller.add(
@@ -2260,6 +2747,7 @@ final class _MessagingSocket implements ImSocket {
                       messageSeq: 5,
                       globalSeq: '5',
                       senderId: 'user-01',
+                      conversationType: conversationType,
                       text: content['text']! as String,
                     )
                   : _assetMessage(
@@ -2434,6 +2922,25 @@ final class _MessagingSocket implements ImSocket {
     );
   }
 
+  void deferCommand(String command) {
+    _deferredCommands.add(command);
+  }
+
+  bool hasDeferredCommand(String command) =>
+      _deferredPackets.containsKey(command);
+
+  void completeDeferredCommand(String command) {
+    final packet = _deferredPackets.remove(command);
+    if (packet == null) throw StateError('no deferred command: $command');
+    _deferredCommands.remove(command);
+    _completingDeferred = true;
+    try {
+      send(jsonEncode(packet));
+    } finally {
+      _completingDeferred = false;
+    }
+  }
+
   @override
   Future<void> close() async {
     closed = true;
@@ -2483,6 +2990,34 @@ final class _MessagingSocket implements ImSocket {
       }),
     );
   }
+
+  void pushGroupMessage({required int messageSeq}) {
+    _controller.add(
+      jsonEncode({
+        'cmd': 'push',
+        'organization': 1,
+        'data': {
+          'event_id':
+              'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+          'event_type': 'message.created',
+          'message_id': 'group-gap-$messageSeq',
+          'conversation_id': 'conversation-01',
+          'message_seq': messageSeq,
+          'message': _message(
+            messageId: 'group-gap-$messageSeq',
+            clientMsgId: 'group-gap-client-$messageSeq',
+            messageSeq: messageSeq,
+            globalSeq: '$messageSeq',
+            conversationId: 'conversation-01',
+            conversationType: 2,
+            senderId: 'member-02',
+            senderOrganization: 1,
+            text: 'gap',
+          ),
+        },
+      }),
+    );
+  }
 }
 
 ({
@@ -2506,6 +3041,99 @@ _ackMetadata(String messageId) {
     senderOrganization: 1,
     senderId: 'peer-01',
   );
+}
+
+Map<String, Object?> _orderedGroupPacket(
+  String command, {
+  required int messageSeq,
+}) {
+  final common = <String, Object?>{
+    'event_id': switch (command) {
+      'ack' =>
+        '1111111111111111111111111111111111111111111111111111111111111111',
+      'conversation_read' =>
+        '2222222222222222222222222222222222222222222222222222222222222222',
+      'recall' =>
+        '3333333333333333333333333333333333333333333333333333333333333333',
+      'edit' =>
+        '4444444444444444444444444444444444444444444444444444444444444444',
+      _ => '5555555555555555555555555555555555555555555555555555555555555555',
+    },
+    'conversation_id': 'conversation-01',
+  };
+  final data = switch (command) {
+    'ack' => {
+      ...common,
+      'event_type': 'message.receipt',
+      'message_id': 'message-$messageSeq',
+      'message_seq': messageSeq,
+      'sender_organization': 1,
+      'sender_id': 'member-02',
+      'user_organization': 1,
+      'user_id': 'user-01',
+      'status': 'delivered',
+      'time': '2026-07-21 10:00:00',
+    },
+    'conversation_read' => {
+      ...common,
+      'event_type': 'conversation.read',
+      'last_read_message_id': 'message-$messageSeq',
+      'last_read_seq': messageSeq,
+      'unread_count': 0,
+      'user_organization': 1,
+      'user_id': 'member-02',
+      'time': '2026-07-21 10:00:00',
+    },
+    'recall' => {
+      ...common,
+      'event_type': 'message.recalled',
+      'message_id': 'message-$messageSeq',
+      'message_seq': messageSeq,
+      'change_seq': 1,
+      'actor_organization': 1,
+      'actor_user_id': 'member-02',
+      'target_organization': null,
+      'target_user_id': null,
+      'status': 'recalled',
+    },
+    'edit' => {
+      ...common,
+      'event_type': 'message.edited',
+      'message_id': 'message-$messageSeq',
+      'message_seq': messageSeq,
+      'change_seq': 1,
+      'actor_organization': 1,
+      'actor_user_id': 'member-02',
+      'target_organization': null,
+      'target_user_id': null,
+      'message': _message(
+        messageId: 'message-$messageSeq',
+        clientMsgId: 'edited-$messageSeq',
+        messageSeq: messageSeq,
+        globalSeq: '$messageSeq',
+        senderId: 'member-02',
+        conversationType: 2,
+        text: 'edited',
+        editCount: 1,
+        editTime: '2026-07-21 10:00:00',
+      ),
+    },
+    'delete' => {
+      ...common,
+      'event_type': 'message.deleted_both',
+      'message_id': 'message-$messageSeq',
+      'message_seq': messageSeq,
+      'change_seq': 1,
+      'actor_organization': 1,
+      'actor_user_id': 'member-02',
+      'target_organization': null,
+      'target_user_id': null,
+      'scope': 'both',
+      'status': 'deleted_both',
+    },
+    _ => throw ArgumentError.value(command, 'command'),
+  };
+  return {'cmd': command, 'organization': 1, 'data': data};
 }
 
 Map<String, Object?> _message({
@@ -2583,6 +3211,15 @@ const _sameOrgIdentity = AppImConversationIdentityContext(
   conversationType: 1,
   peerOrganization: 1,
   peerUserId: 'peer-01',
+);
+
+const _groupIdentity = AppImConversationIdentityContext(
+  organization: 1,
+  userId: 'user-01',
+  conversationId: 'conversation-01',
+  conversationType: 2,
+  peerOrganization: null,
+  peerUserId: null,
 );
 const _crossOrgIdentity = AppImConversationIdentityContext(
   organization: 1,

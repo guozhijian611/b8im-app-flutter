@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import '../discovery/tenant_config.dart';
 import '../network/app_api_client.dart';
+import '../im/group_member_access.dart';
 import '../session/app_session.dart';
 
 final class AnnouncementItem {
@@ -141,6 +142,7 @@ final class SearchMessageHit {
   const SearchMessageHit({
     required this.messageId,
     required this.conversationId,
+    required this.conversationType,
     required this.senderOrganization,
     required this.senderUserId,
     required this.messageType,
@@ -151,10 +153,11 @@ final class SearchMessageHit {
 
   final String messageId;
   final String conversationId;
+  final int conversationType;
   final int senderOrganization;
   final String senderUserId;
   final int messageType;
-  final int messageSeq;
+  final String messageSeq;
   final String content;
   final String? sentAt;
 
@@ -494,6 +497,14 @@ final class AppModuleApiService implements AppModuleGateway {
     String keyword, {
     SearchMessageSenderFilter? sender,
   }) async {
+    final groupAccess = GroupMemberAccessRegistry.lookup(
+      session.organization,
+      session.user.userId,
+    );
+    if (groupAccess == null) {
+      throw StateError('群成员访问快照尚未初始化');
+    }
+    final groupEpoch = groupAccess.captureEpoch();
     final query = <String, String>{
       'q': keyword.trim(),
       'page': '1',
@@ -507,9 +518,16 @@ final class AppModuleApiService implements AppModuleGateway {
       await _get('/saimulti/app/search/messages', query),
       '消息搜索',
     );
-    return rows
+    final hits = rows
         .map((row) {
           final item = _map(row, '搜索结果');
+          final conversationType = _positiveJsonInt(
+            item['conversation_type'],
+            '搜索结果.conversation_type',
+          );
+          if (conversationType != 1 && conversationType != 2) {
+            throw const FormatException('搜索结果.conversation_type 只允许 1 或 2');
+          }
           return SearchMessageHit(
             messageId: _canonicalAccessId(
               item['message_id'],
@@ -519,6 +537,7 @@ final class AppModuleApiService implements AppModuleGateway {
               item['conversation_id'],
               '搜索结果.conversation_id',
             ),
+            conversationType: conversationType,
             senderOrganization: _positiveJsonInt(
               item['sender_organization'],
               '搜索结果.sender_organization',
@@ -531,7 +550,7 @@ final class AppModuleApiService implements AppModuleGateway {
               item['message_type'],
               '搜索结果.message_type',
             ),
-            messageSeq: _positiveJsonInt(
+            messageSeq: _positiveDecimalString(
               item['message_seq'],
               '搜索结果.message_seq',
             ),
@@ -544,6 +563,20 @@ final class AppModuleApiService implements AppModuleGateway {
           );
         })
         .toList(growable: false);
+    groupEpoch.assertCurrent();
+    for (final hit in hits) {
+      final entry = groupAccess.entry(hit.conversationId);
+      if (hit.conversationType == 2 &&
+          (entry == null ||
+              !entry.containsMessageSequenceDecimal(hit.messageSeq))) {
+        throw const FormatException('搜索结果包含未授权或周期外群消息');
+      }
+      if (hit.conversationType == 1 && entry != null) {
+        throw const FormatException('搜索结果 conversation_type 与群访问映射冲突');
+      }
+    }
+    groupEpoch.assertCurrent();
+    return hits;
   }
 
   @override
@@ -732,6 +765,7 @@ const _invalidAccessIdFragments = <String>[
 String _canonicalAccessId(Object? value, String field) {
   if (value is! String ||
       value.isEmpty ||
+      utf8.decode(utf8.encode(value)) != value ||
       utf8.encode(value).length > 64 ||
       value.startsWith(' ') ||
       value.endsWith(' ') ||
@@ -745,6 +779,12 @@ int _nonNegativeInt(Object? value, String field) {
   final integer = _integer(value, field);
   if (integer < 0) throw FormatException('$field 格式无效');
   return integer;
+}
+
+String _positiveDecimalString(Object? value, String field) {
+  final normalized = normalizeGroupAccessPositiveDecimal(value);
+  if (normalized.isEmpty) throw FormatException('$field 格式无效');
+  return normalized;
 }
 
 int _integer(Object? value, String field) {

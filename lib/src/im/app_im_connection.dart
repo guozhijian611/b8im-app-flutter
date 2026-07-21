@@ -9,6 +9,7 @@ import '../observability/trace_context.dart';
 import '../session/app_session.dart';
 import '../session/app_session_service.dart';
 import '../storage/im_sync_cursor_gateway.dart';
+import 'group_member_access.dart';
 import 'im_socket.dart';
 
 final class AppImBootstrapSnapshot {
@@ -18,6 +19,7 @@ final class AppImBootstrapSnapshot {
     required this.credentialSessionId,
     required this.crossOrgAccessSnapshotId,
     required this.highestCrossOrgAccessSnapshotId,
+    required this.groupAccessSnapshotId,
     required this.previousGlobalSeq,
     required this.nextGlobalSeq,
     required this.syncedMessages,
@@ -28,6 +30,7 @@ final class AppImBootstrapSnapshot {
   final String credentialSessionId;
   final String crossOrgAccessSnapshotId;
   final String highestCrossOrgAccessSnapshotId;
+  final String groupAccessSnapshotId;
   final String previousGlobalSeq;
   final String nextGlobalSeq;
   final List<AppImMessage> syncedMessages;
@@ -45,6 +48,9 @@ final class AppImEvent {
     this.mutation,
     this.typing,
     this.accessChanged,
+    this.groupAccessChanged,
+    this.previousGroupAccessSnapshot,
+    this.groupAccessSnapshot,
     this.connectionStatus,
   });
 
@@ -56,12 +62,17 @@ final class AppImEvent {
   final AppImMessageMutation? mutation;
   final AppImTypingState? typing;
   final AppImConversationAccessChanged? accessChanged;
+  final GroupMemberAccessChanged? groupAccessChanged;
+  final GroupMemberAccessSnapshot? previousGroupAccessSnapshot;
+  final GroupMemberAccessSnapshot? groupAccessSnapshot;
   final AppImConnectionStatus? connectionStatus;
 }
 
 abstract interface class AppImRuntime {
   AppImBootstrapSnapshot get bootstrap;
   List<AppImConversationAccessChanged> get recentAccessChanges;
+  GroupMemberAccessSnapshot? get groupAccessSnapshot;
+  bool get isGroupAccessReady;
   Stream<AppImEvent> get events;
   bool get isConnected;
   AppImConnectionStatus get connectionStatus;
@@ -250,6 +261,10 @@ final class AppImConnector implements AppImConnectorGateway {
       organization: tenant.organization,
       userId: session.user.userId,
     );
+    final groupAccess = GroupMemberAccessRegistry(
+      organization: tenant.organization,
+      userId: session.user.userId,
+    );
     return _ReconnectingAppImRuntime.connect(
       connectionFactory: () => AppImConnection.connect(
         tenant: tenant,
@@ -260,10 +275,12 @@ final class AppImConnector implements AppImConnectorGateway {
         timeout: timeout,
         accessSnapshots: accessSnapshots,
         conversationIdentities: conversationIdentities,
+        groupAccess: groupAccess,
       ),
       reconnectDelays: reconnectDelays,
       sleep: sleep,
       conversationIdentities: conversationIdentities,
+      groupAccess: groupAccess,
     );
   }
 }
@@ -280,6 +297,7 @@ final class AppImConnection implements AppImRuntime {
     required this.timeout,
     required this._accessSnapshots,
     required this._conversationIdentities,
+    required this._groupAccess,
   });
 
   static Future<AppImConnection> connect({
@@ -291,6 +309,7 @@ final class AppImConnection implements AppImRuntime {
     Duration timeout = const Duration(seconds: 12),
     AppImAccessSnapshotTracker? accessSnapshots,
     AppImConversationIdentityRegistry? conversationIdentities,
+    GroupMemberAccessRegistry? groupAccess,
   }) async {
     final identityRegistry =
         conversationIdentities ??
@@ -305,6 +324,16 @@ final class AppImConnection implements AppImRuntime {
     final socket = await socketFactory(
       tenant.routing.primary.endpoints.imServerUri,
     ).timeout(timeout);
+    final groupAccessRegistry =
+        groupAccess ??
+        GroupMemberAccessRegistry(
+          organization: tenant.organization,
+          userId: session.user.userId,
+        );
+    if (groupAccessRegistry.organization != tenant.organization ||
+        groupAccessRegistry.userId != session.user.userId) {
+      throw const FormatException('群访问 registry 与 App 会话不一致');
+    }
     final connection = AppImConnection._(
       tenant: tenant,
       session: session,
@@ -314,6 +343,7 @@ final class AppImConnection implements AppImRuntime {
       timeout: timeout,
       accessSnapshots: accessSnapshots ?? AppImAccessSnapshotTracker(''),
       conversationIdentities: identityRegistry,
+      groupAccess: groupAccessRegistry,
     );
     connection._subscription = socket.stream.listen(
       connection._handleRaw,
@@ -352,7 +382,10 @@ final class AppImConnection implements AppImRuntime {
   _recentAccessChanges = LinkedHashMap();
   final AppImConversationIdentityRegistry _conversationIdentities;
   final AppImAccessSnapshotTracker _accessSnapshots;
+  final GroupMemberAccessRegistry _groupAccess;
+  final Set<String> _knownGroupConversationIds = {};
   Future<void> _accessEventQueue = Future<void>.value();
+  Future<void> _groupAccessEventQueue = Future<void>.value();
   _GlobalSyncResult? _pendingGlobalSync;
   Future<bool>? _globalSyncConsumeTask;
   int _accessSnapshotGeneration = 0;
@@ -362,6 +395,9 @@ final class AppImConnection implements AppImRuntime {
   late AppImBootstrapSnapshot _bootstrap;
   bool _authenticated = false;
   bool _closed = false;
+  bool _groupSnapshotStaging = false;
+  final GroupMemberAccessEventBuffer _bufferedGroupAccessEvents =
+      GroupMemberAccessEventBuffer();
 
   @override
   AppImBootstrapSnapshot get bootstrap => _bootstrap;
@@ -369,6 +405,12 @@ final class AppImConnection implements AppImRuntime {
   @override
   List<AppImConversationAccessChanged> get recentAccessChanges =>
       List.unmodifiable(_recentAccessChanges.values);
+
+  @override
+  GroupMemberAccessSnapshot? get groupAccessSnapshot => _groupAccess.snapshot;
+
+  @override
+  bool get isGroupAccessReady => _groupAccess.isReady;
 
   @override
   Stream<AppImEvent> get events => _events.stream;
@@ -387,7 +429,13 @@ final class AppImConnection implements AppImRuntime {
   void registerConversationIdentities(
     Iterable<AppImConversationIdentityContext> identities,
   ) {
-    _conversationIdentities.registerAll(identities);
+    final values = List<AppImConversationIdentityContext>.of(identities);
+    _conversationIdentities.registerAll(values);
+    _knownGroupConversationIds.addAll(
+      values
+          .where((identity) => identity.conversationType == 2)
+          .map((identity) => identity.conversationId),
+    );
   }
 
   Future<AppImBootstrapSnapshot> _authenticateAndSync() async {
@@ -455,6 +503,16 @@ final class AppImConnection implements AppImRuntime {
     } else if (authAccessSnapshotId != '0') {
       await _persistAccessHighWater(_accessSnapshots.highestPositiveSnapshotId);
     }
+    final authGroupSnapshotId = normalizeGroupAccessPositiveDecimal(
+      authData['access_snapshot_id'],
+    );
+    if (authGroupSnapshotId.isEmpty) {
+      throw const AppImConnectionException(
+        'AUTH_ACK access_snapshot_id 无效',
+        code: 'IM_GROUP_ACCESS_SNAPSHOT_INVALID',
+      );
+    }
+    await _completeGroupAccessSnapshot(authGroupSnapshotId);
     final sync = await _syncGlobal();
     _pendingGlobalSync = sync;
     final syncedMessages = _canConsumeGlobalSync(sync)
@@ -469,6 +527,7 @@ final class AppImConnection implements AppImRuntime {
           _accessSnapshots.highestPositiveSnapshotId.isEmpty
           ? '0'
           : _accessSnapshots.highestPositiveSnapshotId,
+      groupAccessSnapshotId: _groupAccess.snapshot!.snapshotId,
       previousGlobalSeq: sync.previousCursor,
       nextGlobalSeq: sync.nextCursor,
       syncedMessages: List.unmodifiable(syncedMessages),
@@ -506,6 +565,7 @@ final class AppImConnection implements AppImRuntime {
   }
 
   Future<_GlobalSyncResult> _syncGlobal() async {
+    _groupAccess.assertReady();
     final previous = await cursorStore.read(
       tenant.organization,
       session.user.userId,
@@ -517,6 +577,8 @@ final class AppImConnection implements AppImRuntime {
       var cursor = previous;
       String? batchSnapshotId;
       final batchAccessGeneration = _accessSnapshotGeneration;
+      final batchGroupGeneration = _groupAccess.generation;
+      final batchGroupSnapshotId = _groupAccess.snapshot!.snapshotId;
       final batchConnectionGeneration = _connectionGeneration;
       final messages = <AppImMessage>[];
       final messageIds = <String>{};
@@ -536,7 +598,11 @@ final class AppImConnection implements AppImRuntime {
           'cmd': 'sync',
           'client_msg_id': requestId,
           'traceparent': TraceContext.root().traceparent,
-          'data': {'after_global_seq': cursor, 'limit': 100},
+          'data': {
+            'after_global_seq': cursor,
+            'limit': 100,
+            'access_snapshot_id': batchGroupSnapshotId,
+          },
         });
         final packet = await waiter;
         _throwIfError(packet);
@@ -555,6 +621,15 @@ final class AppImConnection implements AppImRuntime {
             'SYNC_ACK cross_org_access_snapshot_id 无效',
             code: 'IM_ACCESS_SNAPSHOT_INVALID',
           );
+        }
+        final pageGroupSnapshotId = normalizeGroupAccessPositiveDecimal(
+          data['access_snapshot_id'],
+        );
+        if (pageGroupSnapshotId != batchGroupSnapshotId ||
+            _groupAccess.generation != batchGroupGeneration ||
+            !_groupAccess.isReady) {
+          restart = true;
+          break;
         }
         batchSnapshotId ??= pageAccessSnapshotId;
         if (pageAccessSnapshotId != batchSnapshotId) {
@@ -581,7 +656,10 @@ final class AppImConnection implements AppImRuntime {
           if (message.conversationType == 2 &&
               (message.senderOrganization != tenant.organization ||
                   (systemActorOrganization is int &&
-                      systemActorOrganization != tenant.organization))) {
+                      systemActorOrganization != tenant.organization) ||
+                  !_groupAccess
+                      .assertVisible(message.conversationId)
+                      .containsMessageSequence(message.messageSeq))) {
             throw const AppImConnectionException('群聊 SYNC 消息禁止跨机构发送者');
           }
           if (messageIds.add(message.messageId)) messages.add(message);
@@ -630,6 +708,8 @@ final class AppImConnection implements AppImRuntime {
             _accessSnapshots.highestPositiveSnapshotId,
             batchConnectionGeneration,
             batchAccessGeneration,
+            batchGroupSnapshotId,
+            batchGroupGeneration,
           );
         }
       }
@@ -723,9 +803,92 @@ final class AppImConnection implements AppImRuntime {
       highestCrossOrgAccessSnapshotId: sync.accessSnapshotHighWater.isEmpty
           ? '0'
           : sync.accessSnapshotHighWater,
+      groupAccessSnapshotId: _groupAccess.snapshot!.snapshotId,
       previousGlobalSeq: sync.previousCursor,
       nextGlobalSeq: sync.nextCursor,
       syncedMessages: List.unmodifiable(syncedMessages),
+    );
+  }
+
+  Future<void> _completeGroupAccessSnapshot(String minimumSnapshotId) async {
+    _knownGroupConversationIds.addAll(
+      _groupAccess.snapshot?.entries.keys ?? const <String>[],
+    );
+    _groupAccess.failClose();
+    var minimum = minimumSnapshotId;
+    for (var attempt = 0; attempt < 5; attempt++) {
+      final staging = GroupMemberAccessSnapshotStaging(
+        organization: tenant.organization,
+        minimumSnapshotId: minimum,
+      );
+      _groupSnapshotStaging = true;
+      try {
+        for (var page = 0; page < 1000 && staging.hasMore; page++) {
+          final clientMessageId = _clientMessageId();
+          final waiter = _waitFor({
+            groupMemberAccessSnapshotAckCommand,
+            'error',
+          }, matcher: (packet) => packet['client_msg_id'] == clientMessageId);
+          _send(staging.request(clientMessageId));
+          final packet = await waiter;
+          _throwIfError(packet);
+          staging.accept(packet);
+        }
+        if (staging.hasMore) {
+          throw const AppImConnectionException('群访问快照分页超过安全上限');
+        }
+        final committed = staging.committed();
+        GroupMemberAccessReplacement? replacement;
+        while (true) {
+          final drained = await _bufferedGroupAccessEvents.drain(
+            snapshot: committed,
+            parse: (packet) => GroupMemberAccessChanged.fromPacket(
+              packet,
+              organization: tenant.organization,
+              userId: session.user.userId,
+            ),
+          );
+          if (!_bufferedGroupAccessEvents.isCurrent(drained.epoch)) {
+            continue;
+          }
+          if (drained.newerSnapshotId.isNotEmpty) {
+            minimum = drained.newerSnapshotId;
+            _bufferedGroupAccessEvents.clear();
+            _groupAccess.failClose();
+            break;
+          }
+          if (replacement == null) {
+            replacement = _groupAccess.beginReplacement(committed);
+            await replacement.cleanup;
+            if (_closed) {
+              throw const AppImConnectionException('群访问清理期间连接已关闭');
+            }
+            continue;
+          }
+          _groupSnapshotStaging = false;
+          _groupAccess.commitReplacement(replacement);
+          _knownGroupConversationIds.addAll(replacement.snapshot.entries.keys);
+          for (final eventId in drained.eventIds) {
+            _groupAccess.remember(eventId);
+          }
+          _bufferedGroupAccessEvents.clear();
+          return;
+        }
+        if (_groupSnapshotStaging) {
+          _groupAccess.failClose();
+          continue;
+        }
+      } on Object {
+        staging.discard();
+        _groupAccess.failClose();
+        _bufferedGroupAccessEvents.clear();
+        if (_closed) rethrow;
+      }
+    }
+    _groupSnapshotStaging = false;
+    throw const AppImConnectionException(
+      '群访问快照持续失效',
+      code: 'IM_GROUP_ACCESS_SNAPSHOT_UNSTABLE',
     );
   }
 
@@ -735,12 +898,23 @@ final class AppImConnection implements AppImRuntime {
         identical(_pendingGlobalSync, pending) &&
         _connectionGeneration == pending.connectionGeneration &&
         _accessSnapshotGeneration == pending.accessGeneration &&
-        _accessSnapshots.latestSnapshotId == pending.crossOrgAccessSnapshotId;
+        _accessSnapshots.latestSnapshotId == pending.crossOrgAccessSnapshotId &&
+        _groupAccess.isReady &&
+        _groupAccess.snapshot?.snapshotId == pending.groupAccessSnapshotId &&
+        _groupAccess.generation == pending.groupGeneration;
   }
 
   bool _canConsumeGlobalSync(_GlobalSyncResult pending) {
-    if (!_accessSnapshots.isCrossOrganizationFailClosed) return true;
     for (final message in pending.messages) {
+      if (message.conversationType == 2) {
+        final entry = _groupAccess.entry(message.conversationId);
+        if (entry == null ||
+            !entry.containsMessageSequence(message.messageSeq)) {
+          return false;
+        }
+        continue;
+      }
+      if (!_accessSnapshots.isCrossOrganizationFailClosed) continue;
       final systemActorOrganization = message.messageType == 5
           ? (message.content ?? const <String, Object?>{})['actor_organization']
           : null;
@@ -820,6 +994,7 @@ final class AppImConnection implements AppImRuntime {
     if (!isConnected) {
       throw const AppImConnectionException('IM 连接未就绪');
     }
+    GroupMemberAccessEpoch? groupEpoch;
     final data = <String, Object?>{
       'conversation_type': conversationType,
       'message_type': messageType,
@@ -845,6 +1020,8 @@ final class AppImConnection implements AppImRuntime {
       if (target.isEmpty) {
         throw const FormatException('群聊缺少 conversation_id');
       }
+      _groupAccess.assertActive(target);
+      groupEpoch = _groupAccess.captureEpoch();
       data['conversation_id'] = target;
     } else {
       throw const FormatException('conversation_type 只允许 1 或 2');
@@ -862,6 +1039,7 @@ final class AppImConnection implements AppImRuntime {
       'data': data,
     });
     final packet = await waiter;
+    groupEpoch?.assertCurrent();
     _throwIfError(packet);
     final ack = imMap(packet['data'], 'send_ack.data');
     if (packet['organization'] != tenant.organization ||
@@ -890,6 +1068,7 @@ final class AppImConnection implements AppImRuntime {
         !_containsExpectedContent(message.content, content)) {
       throw const AppImConnectionException('SEND_ACK 与发送请求不一致');
     }
+    groupEpoch?.assertCurrent();
     _conversationIdentities.registerAll([
       AppImConversationIdentityContext(
         organization: tenant.organization,
@@ -903,6 +1082,7 @@ final class AppImConnection implements AppImRuntime {
     _events.add(
       AppImEvent(command: 'send_ack', message: message, eventId: null),
     );
+    groupEpoch?.assertCurrent();
     return message;
   }
 
@@ -919,6 +1099,10 @@ final class AppImConnection implements AppImRuntime {
       throw const FormatException('客户端 ACK 只允许 delivered 或 read');
     }
     _assertConversationIdentity(identity, message: message);
+    final groupEpoch = _captureActiveGroupEpoch(
+      identity,
+      messageSequence: message.messageSeq,
+    );
     final normalizedMessageId = message.messageId.trim();
     if (normalizedMessageId.isEmpty) {
       throw const FormatException('ACK 缺少 message_id');
@@ -926,12 +1110,15 @@ final class AppImConnection implements AppImRuntime {
     final pending = _pendingReceipts[normalizedMessageId];
     if (pending != null) {
       final receipt = await pending;
+      groupEpoch?.assertCurrent();
       if (receipt.status.rank >= status.rank) return receipt;
     }
-    final operation = _sendAcknowledgement(message, status);
+    final operation = _sendAcknowledgement(message, status, groupEpoch);
     _pendingReceipts[normalizedMessageId] = operation;
     try {
-      return await operation;
+      final receipt = await operation;
+      groupEpoch?.assertCurrent();
+      return receipt;
     } finally {
       if (identical(_pendingReceipts[normalizedMessageId], operation)) {
         _pendingReceipts.remove(normalizedMessageId);
@@ -942,6 +1129,7 @@ final class AppImConnection implements AppImRuntime {
   Future<AppImReceipt> _sendAcknowledgement(
     AppImMessage message,
     AppImDeliveryStatus status,
+    GroupMemberAccessEpoch? groupEpoch,
   ) async {
     final normalizedMessageId = message.messageId.trim();
     final requestId = _clientMessageId();
@@ -956,6 +1144,7 @@ final class AppImConnection implements AppImRuntime {
       'data': {'message_id': normalizedMessageId, 'status': status.name},
     });
     final packet = await waiter;
+    groupEpoch?.assertCurrent();
     _throwIfError(packet);
     final data = imMap(packet['data'], 'ack_ack.data');
     final receipt = AppImReceipt.fromJson(data, 'ack_ack.data');
@@ -974,6 +1163,7 @@ final class AppImConnection implements AppImRuntime {
         receipt.status.rank < status.rank) {
       throw const AppImConnectionException('ACK_ACK 与请求不一致');
     }
+    groupEpoch?.assertCurrent();
     return receipt;
   }
 
@@ -986,6 +1176,10 @@ final class AppImConnection implements AppImRuntime {
       throw const AppImConnectionException('IM 连接未就绪');
     }
     _assertConversationIdentity(identity, message: lastReadMessage);
+    final groupEpoch = _captureActiveGroupEpoch(
+      identity,
+      messageSequence: lastReadMessage.messageSeq,
+    );
     final normalizedConversationId = identity.conversationId.trim();
     final normalizedMessageId = lastReadMessage.messageId.trim();
     if (normalizedConversationId.isEmpty || normalizedMessageId.isEmpty) {
@@ -1009,6 +1203,7 @@ final class AppImConnection implements AppImRuntime {
       },
     });
     final packet = await waiter;
+    groupEpoch?.assertCurrent();
     _throwIfError(packet);
     final state = AppImConversationReadState.fromJson(
       packet['data'],
@@ -1022,6 +1217,7 @@ final class AppImConnection implements AppImRuntime {
         state.userId != session.user.userId) {
       throw const AppImConnectionException('CONVERSATION_READ_ACK 与请求不一致');
     }
+    groupEpoch?.assertCurrent();
     return state;
   }
 
@@ -1044,6 +1240,12 @@ final class AppImConnection implements AppImRuntime {
         limit > 100) {
       throw const FormatException('会话 SYNC 参数无效');
     }
+    final groupEntry = identity.conversationType == 2
+        ? _groupAccess.assertVisible(normalizedConversationId)
+        : null;
+    final groupEpoch = identity.conversationType == 2
+        ? _groupAccess.captureEpoch()
+        : null;
     final requestId = _clientMessageId();
     final waiter = _waitFor(
       {'sync_ack', 'error'},
@@ -1065,9 +1267,12 @@ final class AppImConnection implements AppImRuntime {
         'after_seq': afterMessageSeq,
         'after_change_seq': afterChangeSeq,
         'limit': limit,
+        'access_snapshot_id': _groupAccess.snapshot!.snapshotId,
+        if (groupEntry != null) 'access_version': groupEntry.accessVersion,
       },
     });
     final packet = await waiter;
+    groupEpoch?.assertCurrent();
     _throwIfError(packet);
     if (packet['organization'] != tenant.organization) {
       throw const AppImConnectionException('会话 SYNC_ACK organization 不一致');
@@ -1076,6 +1281,13 @@ final class AppImConnection implements AppImRuntime {
       packet['data'],
       identity: identity,
     );
+    groupEpoch?.assertCurrent();
+    if (page.groupAccessSnapshotId != _groupAccess.snapshot!.snapshotId ||
+        (groupEntry != null &&
+            (page.groupAccessVersion != groupEntry.accessVersion ||
+                page.groupAccessState != groupEntry.accessState.wireName))) {
+      throw const AppImConnectionException('会话 SYNC_ACK 群访问版本不一致');
+    }
     if (page.nextAfterMessageSeq < afterMessageSeq ||
         page.nextAfterChangeSeq < afterChangeSeq ||
         (page.messagesHasMore && page.nextAfterMessageSeq == afterMessageSeq) ||
@@ -1090,6 +1302,10 @@ final class AppImConnection implements AppImRuntime {
           message.messageSeq > page.nextAfterMessageSeq) {
         throw const AppImConnectionException('会话 SYNC_ACK 消息序列无效');
       }
+      if (groupEntry != null &&
+          !groupEntry.containsMessageSequence(message.messageSeq)) {
+        throw const AppImConnectionException('会话 SYNC_ACK 消息超出群访问周期');
+      }
       previousMessageSeq = message.messageSeq;
     }
     var previousChangeSeq = afterChangeSeq;
@@ -1098,8 +1314,13 @@ final class AppImConnection implements AppImRuntime {
           change.changeSeq > page.nextAfterChangeSeq) {
         throw const AppImConnectionException('会话 SYNC_ACK 变更序列无效');
       }
+      if (groupEntry != null &&
+          !groupEntry.containsMessageSequence(change.messageSeq)) {
+        throw const AppImConnectionException('会话 SYNC_ACK 变更超出群访问周期');
+      }
       previousChangeSeq = change.changeSeq;
     }
+    groupEpoch?.assertCurrent();
     return page;
   }
 
@@ -1109,18 +1330,24 @@ final class AppImConnection implements AppImRuntime {
     required AppImConversationIdentityContext identity,
   }) async {
     _assertConversationIdentity(identity, message: message);
+    final groupEpoch = _captureActiveGroupEpoch(
+      identity,
+      messageSequence: message.messageSeq,
+    );
     _assertOwnMutableMessage(message, requireText: false);
     final packet = await _sendMutationRequest(
       command: 'recall',
       ackCommand: 'recall_ack',
       message: message,
       data: {'message_id': message.messageId},
+      groupEpoch: groupEpoch,
     );
+    groupEpoch?.assertCurrent();
     final data = imMap(packet['data'], 'recall_ack.data');
     if (data['recalled'] != true || !_isPositiveInt(data['change_seq'])) {
       throw const AppImConnectionException('RECALL_ACK 状态无效');
     }
-    return AppImMutationResult(
+    final result = AppImMutationResult(
       command: 'recall',
       conversationId: message.conversationId,
       messageId: message.messageId,
@@ -1130,6 +1357,8 @@ final class AppImConnection implements AppImRuntime {
       status: 'recalled',
       message: null,
     );
+    groupEpoch?.assertCurrent();
+    return result;
   }
 
   @override
@@ -1139,6 +1368,10 @@ final class AppImConnection implements AppImRuntime {
     required AppImConversationIdentityContext identity,
   }) async {
     _assertConversationIdentity(identity, message: message);
+    final groupEpoch = _captureActiveGroupEpoch(
+      identity,
+      messageSequence: message.messageSeq,
+    );
     _assertOwnMutableMessage(message, requireText: true);
     final normalized = text.trim();
     if (normalized.isEmpty || normalized.length > 4000) {
@@ -1152,7 +1385,9 @@ final class AppImConnection implements AppImRuntime {
         'message_id': message.messageId,
         'content': {'text': normalized},
       },
+      groupEpoch: groupEpoch,
     );
+    groupEpoch?.assertCurrent();
     final data = imMap(packet['data'], 'edit_ack.data');
     if (!_isPositiveInt(data['change_seq']) ||
         !_deepEqual(data['content'], {'text': normalized})) {
@@ -1169,7 +1404,7 @@ final class AppImConnection implements AppImRuntime {
         edited.editCount <= message.editCount) {
       throw const AppImConnectionException('EDIT_ACK 与原消息或请求不一致');
     }
-    return AppImMutationResult(
+    final result = AppImMutationResult(
       command: 'edit',
       conversationId: message.conversationId,
       messageId: message.messageId,
@@ -1179,6 +1414,8 @@ final class AppImConnection implements AppImRuntime {
       status: '',
       message: edited,
     );
+    groupEpoch?.assertCurrent();
+    return result;
   }
 
   @override
@@ -1188,6 +1425,10 @@ final class AppImConnection implements AppImRuntime {
     required AppImConversationIdentityContext identity,
   }) async {
     _assertConversationIdentity(identity, message: message);
+    final groupEpoch = _captureActiveGroupEpoch(
+      identity,
+      messageSequence: message.messageSeq,
+    );
     final normalizedScope = scope.trim();
     if (!const {'self', 'both'}.contains(normalizedScope)) {
       throw const FormatException('删除范围只允许 self 或 both');
@@ -1200,13 +1441,15 @@ final class AppImConnection implements AppImRuntime {
       ackCommand: 'delete_ack',
       message: message,
       data: {'message_id': message.messageId, 'scope': normalizedScope},
+      groupEpoch: groupEpoch,
     );
+    groupEpoch?.assertCurrent();
     final data = imMap(packet['data'], 'delete_ack.data');
     if (data['scope'] != normalizedScope ||
         !_isPositiveInt(data['change_seq'])) {
       throw const AppImConnectionException('DELETE_ACK 与请求范围不一致');
     }
-    return AppImMutationResult(
+    final result = AppImMutationResult(
       command: 'delete',
       conversationId: message.conversationId,
       messageId: message.messageId,
@@ -1216,6 +1459,8 @@ final class AppImConnection implements AppImRuntime {
       status: normalizedScope == 'both' ? 'deleted_both' : '',
       message: null,
     );
+    groupEpoch?.assertCurrent();
+    return result;
   }
 
   @override
@@ -1223,6 +1468,7 @@ final class AppImConnection implements AppImRuntime {
     AppImConversationIdentityContext identity,
   ) {
     _assertConversationIdentity(identity);
+    final groupEpoch = _captureActiveGroupEpoch(identity);
     final normalized = identity.conversationId.trim();
     if (normalized.isEmpty) {
       throw const FormatException('截屏提示缺少 conversation_id');
@@ -1230,7 +1476,7 @@ final class AppImConnection implements AppImRuntime {
     final pending = _pendingScreenshots[normalized];
     if (pending != null) return pending;
     late final Future<AppImMessage?> operation;
-    operation = _sendScreenshotRequest(normalized).whenComplete(() {
+    operation = _sendScreenshotRequest(normalized, groupEpoch).whenComplete(() {
       if (identical(_pendingScreenshots[normalized], operation)) {
         _pendingScreenshots.remove(normalized);
       }
@@ -1239,7 +1485,10 @@ final class AppImConnection implements AppImRuntime {
     return operation;
   }
 
-  Future<AppImMessage?> _sendScreenshotRequest(String conversationId) async {
+  Future<AppImMessage?> _sendScreenshotRequest(
+    String conversationId,
+    GroupMemberAccessEpoch? groupEpoch,
+  ) async {
     if (!isConnected) {
       throw const AppImConnectionException('IM 连接未就绪');
     }
@@ -1255,6 +1504,7 @@ final class AppImConnection implements AppImRuntime {
       'data': {'conversation_id': conversationId},
     });
     final packet = await waiter;
+    groupEpoch?.assertCurrent();
     _throwIfError(packet);
     final data = imMap(packet['data'], 'screenshot_ack.data');
     if (packet['organization'] != tenant.organization ||
@@ -1271,7 +1521,10 @@ final class AppImConnection implements AppImRuntime {
     if (enabled != (noticeValue != null)) {
       throw const AppImConnectionException('SCREENSHOT_ACK 提示状态不一致');
     }
-    if (!enabled) return null;
+    if (!enabled) {
+      groupEpoch?.assertCurrent();
+      return null;
+    }
     final notice = AppImMessage.fromRealtime(noticeValue);
     if (notice.organization != tenant.organization ||
         notice.conversationId != conversationId ||
@@ -1281,12 +1534,16 @@ final class AppImConnection implements AppImRuntime {
         notice.content?['actor_user_id'] != session.user.userId) {
       throw const AppImConnectionException('SCREENSHOT_ACK 系统提示无效');
     }
+    groupEpoch?.assertCurrent();
     return notice;
   }
 
   @override
   void sendTyping(AppImConversationIdentityContext identity) {
     _assertConversationIdentity(identity);
+    if (identity.conversationType == 2) {
+      _groupAccess.assertActive(identity.conversationId);
+    }
     final normalized = identity.conversationId.trim();
     if (!isConnected) {
       throw const AppImConnectionException('IM 连接未就绪');
@@ -1306,6 +1563,7 @@ final class AppImConnection implements AppImRuntime {
     required String ackCommand,
     required AppImMessage message,
     required Map<String, Object?> data,
+    required GroupMemberAccessEpoch? groupEpoch,
   }) async {
     if (!isConnected) {
       throw const AppImConnectionException('IM 连接未就绪');
@@ -1322,6 +1580,7 @@ final class AppImConnection implements AppImRuntime {
       'data': data,
     });
     final packet = await waiter;
+    groupEpoch?.assertCurrent();
     _throwIfError(packet);
     final response = imMap(packet['data'], '$ackCommand.data');
     if (packet['organization'] != tenant.organization ||
@@ -1333,6 +1592,7 @@ final class AppImConnection implements AppImRuntime {
         response['conversation_id'] != message.conversationId) {
       throw AppImConnectionException('${ackCommand.toUpperCase()} 与原消息不一致');
     }
+    groupEpoch?.assertCurrent();
     return packet;
   }
 
@@ -1344,6 +1604,9 @@ final class AppImConnection implements AppImRuntime {
       throw const FormatException('会话复合身份上下文无效');
     }
     _conversationIdentities.registerAll([identity]);
+    if (identity.conversationType == 2) {
+      _knownGroupConversationIds.add(identity.conversationId);
+    }
     final registered = _conversationIdentities[identity.conversationId];
     if (registered == null ||
         (message != null && !registered.acceptsMessage(message))) {
@@ -1358,16 +1621,67 @@ final class AppImConnection implements AppImRuntime {
     }
   }
 
+  GroupMemberAccessEpoch? _captureActiveGroupEpoch(
+    AppImConversationIdentityContext identity, {
+    int? messageSequence,
+  }) {
+    if (identity.conversationType != 2) return null;
+    final entry = _groupAccess.assertActive(identity.conversationId);
+    if (messageSequence != null &&
+        (messageSequence <= 0 ||
+            !entry.containsMessageSequence(messageSequence))) {
+      throw StateError('目标消息超出当前群访问周期');
+    }
+    return _groupAccess.captureEpoch();
+  }
+
+  bool _isKnownGroupConversation(
+    String conversationId, {
+    int? conversationType,
+  }) =>
+      conversationType == 2 ||
+      _conversationIdentities[conversationId]?.conversationType == 2 ||
+      _knownGroupConversationIds.contains(conversationId) ||
+      (_groupAccess.snapshot?.entries.containsKey(conversationId) ?? false);
+
+  bool _acceptOrderedGroupSequence(
+    String conversationId,
+    int messageSequence, {
+    int? conversationType,
+  }) {
+    if (!_isKnownGroupConversation(
+      conversationId,
+      conversationType: conversationType,
+    )) {
+      return true;
+    }
+    final minimumSnapshotId = _groupAccess.snapshot?.snapshotId;
+    if (!_groupAccess.isReady) return false;
+    final entry = _groupAccess.entry(conversationId);
+    if (messageSequence > 0 &&
+        entry != null &&
+        entry.containsMessageSequence(messageSequence)) {
+      return true;
+    }
+    _groupAccess.failClose();
+    _pendingGlobalSync = null;
+    _accessSnapshotGeneration += 1;
+    if (minimumSnapshotId != null) {
+      _queueGroupAccessSnapshotRecovery(minimumSnapshotId);
+    }
+    return false;
+  }
+
   bool _isFailClosedConversation(
     String conversationId, {
     int? conversationType,
     int? foreignOrganization,
   }) {
     final identity = _conversationIdentities[conversationId];
-    if ((conversationType == 2 || identity?.conversationType == 2) &&
-        foreignOrganization != null &&
-        foreignOrganization != tenant.organization) {
-      return true;
+    if (conversationType == 2 || identity?.conversationType == 2) {
+      if (!_groupAccess.isReady) return true;
+      final entry = _groupAccess.entry(conversationId);
+      return entry == null || !entry.isActive;
     }
     if (!_accessSnapshots.isCrossOrganizationFailClosed) return false;
     if (foreignOrganization != null &&
@@ -1434,10 +1748,17 @@ final class AppImConnection implements AppImRuntime {
             receipt.senderOrganization != tenant.organization
             ? receipt.senderOrganization
             : receipt.userOrganization;
-        if (_isFailClosedConversation(
-          receipt.conversationId,
-          foreignOrganization: foreignOrganization,
-        )) {
+        final isGroup = _isKnownGroupConversation(receipt.conversationId);
+        if ((isGroup &&
+                !_acceptOrderedGroupSequence(
+                  receipt.conversationId,
+                  receipt.messageSeq,
+                )) ||
+            (!isGroup &&
+                _isFailClosedConversation(
+                  receipt.conversationId,
+                  foreignOrganization: foreignOrganization,
+                ))) {
           return;
         }
         final eventId = _observeEvent(data, 'message.receipt');
@@ -1458,10 +1779,17 @@ final class AppImConnection implements AppImRuntime {
           data,
           'conversation_read.data',
         );
-        if (_isFailClosedConversation(
-          read.conversationId,
-          foreignOrganization: read.userOrganization,
-        )) {
+        final isGroup = _isKnownGroupConversation(read.conversationId);
+        if ((isGroup &&
+                !_acceptOrderedGroupSequence(
+                  read.conversationId,
+                  read.lastReadSeq,
+                )) ||
+            (!isGroup &&
+                _isFailClosedConversation(
+                  read.conversationId,
+                  foreignOrganization: read.userOrganization,
+                ))) {
           return;
         }
         final eventId = _observeEvent(data, 'conversation.read');
@@ -1486,10 +1814,17 @@ final class AppImConnection implements AppImRuntime {
             mutation.actorOrganization != tenant.organization
             ? mutation.actorOrganization
             : mutation.targetOrganization;
-        if (_isFailClosedConversation(
-          mutation.conversationId,
-          foreignOrganization: foreignOrganization,
-        )) {
+        final isGroup = _isKnownGroupConversation(mutation.conversationId);
+        if ((isGroup &&
+                !_acceptOrderedGroupSequence(
+                  mutation.conversationId,
+                  mutation.messageSeq,
+                )) ||
+            (!isGroup &&
+                _isFailClosedConversation(
+                  mutation.conversationId,
+                  foreignOrganization: foreignOrganization,
+                ))) {
           return;
         }
         if (!_seenEventIds.add(mutation.eventId)) return;
@@ -1548,6 +1883,24 @@ final class AppImConnection implements AppImRuntime {
         );
         return;
       }
+      if (command == groupMemberAccessSnapshotAckCommand) {
+        throw const FormatException('收到乱序或重复的群访问快照页');
+      }
+      if (command == groupMemberAccessChangedCommand) {
+        if (_groupSnapshotStaging) {
+          if (_bufferedGroupAccessEvents.length >= 256) {
+            _bufferedGroupAccessEvents.invalidate();
+            return;
+          }
+          _bufferedGroupAccessEvents.add(packet);
+          return;
+        }
+        _groupAccess.failClose();
+        _pendingGlobalSync = null;
+        _accessSnapshotGeneration += 1;
+        _queueGroupAccessRecovery(packet);
+        return;
+      }
       if (command == 'error') {
         _events.addError(_errorFromPacket(packet));
         return;
@@ -1594,6 +1947,95 @@ final class AppImConnection implements AppImRuntime {
     );
   }
 
+  void _queueGroupAccessRecovery(Map<String, Object?> packet) {
+    final operation = _groupAccessEventQueue.then((_) async {
+      final fallbackSnapshotId = _groupAccess.snapshot?.snapshotId;
+      late final GroupMemberAccessChanged event;
+      try {
+        event = await GroupMemberAccessChanged.fromPacket(
+          packet,
+          organization: tenant.organization,
+          userId: session.user.userId,
+        );
+      } on FormatException {
+        if (fallbackSnapshotId == null) rethrow;
+        await _reloadGroupAccessAndSync(fallbackSnapshotId);
+        return;
+      }
+      final projection = _groupAccess.project(event);
+      if (projection.decision == GroupMemberAccessEventDecision.stale ||
+          projection.decision == GroupMemberAccessEventDecision.duplicate) {
+        final existing = _groupAccess.snapshot;
+        if (existing == null) {
+          throw const FormatException('群访问实时事件缺少已提交快照');
+        }
+        await _groupAccess.replace(existing);
+        return;
+      }
+      if (projection.decision == GroupMemberAccessEventDecision.shrink) {
+        _groupAccess.remember(event.eventId);
+        if (!_events.isClosed) {
+          _events.add(
+            AppImEvent(
+              command: groupMemberAccessChangedCommand,
+              message: null,
+              eventId: event.eventId,
+              groupAccessChanged: event,
+            ),
+          );
+        }
+      }
+      await _reloadGroupAccessAndSync(event.snapshotId);
+    });
+    _groupAccessEventQueue = operation.then<void>((_) {}, onError: (_, _) {});
+    unawaited(
+      operation.then<void>(
+        (_) {},
+        onError: (Object error, StackTrace stackTrace) {
+          if (!_events.isClosed) _events.addError(error, stackTrace);
+          unawaited(close());
+        },
+      ),
+    );
+  }
+
+  void _queueGroupAccessSnapshotRecovery(String minimumSnapshotId) {
+    final operation = _groupAccessEventQueue.then((_) async {
+      await _reloadGroupAccessAndSync(minimumSnapshotId);
+    });
+    _groupAccessEventQueue = operation.then<void>((_) {}, onError: (_, _) {});
+    unawaited(
+      operation.then<void>(
+        (_) {},
+        onError: (Object error, StackTrace stackTrace) {
+          if (!_events.isClosed) _events.addError(error, stackTrace);
+          unawaited(close());
+        },
+      ),
+    );
+  }
+
+  Future<void> _reloadGroupAccessAndSync(String minimumSnapshotId) async {
+    final previous = _groupAccess.snapshot;
+    await _completeGroupAccessSnapshot(minimumSnapshotId);
+    if (_closed || !_authenticated) return;
+    if (!_events.isClosed) {
+      _events.add(
+        AppImEvent(
+          command: groupMemberAccessSnapshotAckCommand,
+          message: null,
+          eventId: null,
+          previousGroupAccessSnapshot: previous,
+          groupAccessSnapshot: _groupAccess.snapshot,
+        ),
+      );
+    }
+    final sync = await _syncGlobal();
+    if (_closed || !_authenticated || !_groupAccess.isReady) return;
+    _pendingGlobalSync = sync;
+    _updateBootstrapSync(sync);
+  }
+
   void _handlePush(Map<String, Object?> packet) {
     final data = imMap(packet['data'], 'push.data');
     final eventId = _observeEvent(data, 'message.created');
@@ -1614,6 +2056,19 @@ final class AppImConnection implements AppImRuntime {
     final systemActorOrganization = message.messageType == 5
         ? (message.content ?? const <String, Object?>{})['actor_organization']
         : null;
+    if (message.conversationType == 2) {
+      if (!_groupAccess.isReady) return;
+      final entry = _groupAccess.entry(message.conversationId);
+      if (entry == null || !entry.isActive) return;
+      if (!entry.containsMessageSequence(message.messageSeq)) {
+        final minimumSnapshotId = _groupAccess.snapshot!.snapshotId;
+        _groupAccess.failClose();
+        _pendingGlobalSync = null;
+        _accessSnapshotGeneration += 1;
+        _queueGroupAccessSnapshotRecovery(minimumSnapshotId);
+        return;
+      }
+    }
     if (_isFailClosedConversation(
       message.conversationId,
       conversationType: message.conversationType,
@@ -1731,6 +2186,10 @@ final class AppImConnection implements AppImRuntime {
     }
     _waiters.clear();
     await _accessEventQueue;
+    await _groupAccessEventQueue;
+    _groupAccess.failClose();
+    _groupSnapshotStaging = false;
+    _bufferedGroupAccessEvents.clear();
     await _subscription?.cancel();
     await socket.close();
     await _events.close();
@@ -1801,6 +2260,7 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
     required List<Duration> reconnectDelays,
     required this._sleep,
     required this._conversationIdentities,
+    required this._groupAccess,
   }) : _reconnectDelays = List.unmodifiable(reconnectDelays);
 
   static Future<_ReconnectingAppImRuntime> connect({
@@ -1808,6 +2268,7 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
     required List<Duration> reconnectDelays,
     required Future<void> Function(Duration duration) sleep,
     required AppImConversationIdentityRegistry conversationIdentities,
+    required GroupMemberAccessRegistry groupAccess,
   }) async {
     if (reconnectDelays.isEmpty ||
         reconnectDelays.any((item) => item.isNegative)) {
@@ -1818,9 +2279,15 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
       reconnectDelays: reconnectDelays,
       sleep: sleep,
       conversationIdentities: conversationIdentities,
+      groupAccess: groupAccess,
     );
+    final previousGroupAccessSnapshot = runtime._groupAccess.snapshot;
     final connection = await connectionFactory();
-    if (!runtime._attach(connection, generation: runtime._generation)) {
+    if (!runtime._attach(
+      connection,
+      generation: runtime._generation,
+      previousGroupAccessSnapshot: previousGroupAccessSnapshot,
+    )) {
       throw const AppImConnectionException(
         'IM 初始连接访问快照早于本地高水位',
         code: 'IM_ACCESS_SNAPSHOT_UNSTABLE',
@@ -1833,6 +2300,7 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
   final List<Duration> _reconnectDelays;
   final Future<void> Function(Duration duration) _sleep;
   final AppImConversationIdentityRegistry _conversationIdentities;
+  final GroupMemberAccessRegistry _groupAccess;
   final StreamController<AppImEvent> _events =
       StreamController<AppImEvent>.broadcast(sync: true);
   final LinkedHashMap<String, AppImConversationAccessChanged>
@@ -1853,6 +2321,12 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
   @override
   List<AppImConversationAccessChanged> get recentAccessChanges =>
       List.unmodifiable(_recentAccessChanges.values);
+
+  @override
+  GroupMemberAccessSnapshot? get groupAccessSnapshot => _groupAccess.snapshot;
+
+  @override
+  bool get isGroupAccessReady => _groupAccess.isReady;
 
   @override
   Stream<AppImEvent> get events => _events.stream;
@@ -1910,7 +2384,11 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
     return consumed;
   }
 
-  bool _attach(AppImConnection connection, {required int generation}) {
+  bool _attach(
+    AppImConnection connection, {
+    required int generation,
+    required GroupMemberAccessSnapshot? previousGroupAccessSnapshot,
+  }) {
     if (_closed || generation != _generation) {
       unawaited(connection.close());
       return false;
@@ -1944,6 +2422,7 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
           _accessSnapshots.highestPositiveSnapshotId.isEmpty
           ? '0'
           : _accessSnapshots.highestPositiveSnapshotId,
+      groupAccessSnapshotId: incoming.groupAccessSnapshotId,
       previousGlobalSeq: incoming.previousGlobalSeq,
       nextGlobalSeq: incoming.nextGlobalSeq,
       syncedMessages: incoming.syncedMessages,
@@ -1959,6 +2438,19 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
       onError: _events.addError,
       onDone: () => _handleDisconnected(connection),
     );
+    final nextGroupAccessSnapshot = _groupAccess.snapshot;
+    if (previousGroupAccessSnapshot != null &&
+        nextGroupAccessSnapshot != null) {
+      _events.add(
+        AppImEvent(
+          command: groupMemberAccessSnapshotAckCommand,
+          message: null,
+          eventId: null,
+          previousGroupAccessSnapshot: previousGroupAccessSnapshot,
+          groupAccessSnapshot: nextGroupAccessSnapshot,
+        ),
+      );
+    }
     _setStatus(AppImConnectionStatus.connected);
     return true;
   }
@@ -2001,12 +2493,17 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
       await _sleep(delay);
       if (_closed || generation != _generation || _active != null) return;
       try {
+        final previousGroupAccessSnapshot = _groupAccess.snapshot;
         final connection = await _connectionFactory();
         if (_closed || generation != _generation) {
           await connection.close();
           return;
         }
-        if (_attach(connection, generation: generation)) {
+        if (_attach(
+          connection,
+          generation: generation,
+          previousGroupAccessSnapshot: previousGroupAccessSnapshot,
+        )) {
           return;
         }
         attempt += 1;
@@ -2182,6 +2679,7 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
   Future<void> reconnect() async {
     if (_closed) throw const AppImConnectionException('IM 连接已关闭');
     final generation = ++_generation;
+    final previousGroupAccessSnapshot = _groupAccess.snapshot;
     final current = _active;
     _active = null;
     await _activeSubscription?.cancel();
@@ -2194,7 +2692,11 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
         await connection.close();
         return;
       }
-      if (!_attach(connection, generation: generation)) {
+      if (!_attach(
+        connection,
+        generation: generation,
+        previousGroupAccessSnapshot: previousGroupAccessSnapshot,
+      )) {
         throw const AppImConnectionException(
           'IM 重连访问快照早于本地高水位',
           code: 'IM_ACCESS_SNAPSHOT_UNSTABLE',
@@ -2247,6 +2749,8 @@ final class _GlobalSyncResult {
     this.accessSnapshotHighWater,
     this.connectionGeneration,
     this.accessGeneration,
+    this.groupAccessSnapshotId,
+    this.groupGeneration,
   );
 
   final String previousCursor;
@@ -2256,6 +2760,8 @@ final class _GlobalSyncResult {
   final String accessSnapshotHighWater;
   final int connectionGeneration;
   final int accessGeneration;
+  final String groupAccessSnapshotId;
+  final int groupGeneration;
 }
 
 final class AppImConnectionException implements Exception {
@@ -2273,4 +2779,6 @@ bool isAppImAccessSnapshotFailure(Object error) =>
     const {
       'IM_ACCESS_SNAPSHOT_INVALID',
       'IM_ACCESS_SNAPSHOT_UNSTABLE',
+      'IM_GROUP_ACCESS_SNAPSHOT_INVALID',
+      'IM_GROUP_ACCESS_SNAPSHOT_UNSTABLE',
     }.contains(error.code);

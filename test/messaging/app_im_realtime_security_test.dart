@@ -293,6 +293,7 @@ void main() {
       'messages_has_more': false,
       'changes_has_more': false,
       'cross_org_access_snapshot_id': '1',
+      'access_snapshot_id': '1',
     };
 
     final valid = AppImConversationSyncPage.fromJson(

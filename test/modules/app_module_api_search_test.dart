@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 
+import 'package:b8im_app_flutter/src/im/group_member_access.dart';
 import 'package:b8im_app_flutter/src/modules/app_module_api.dart';
 import 'package:b8im_app_flutter/src/network/app_api_client.dart';
 import 'package:b8im_app_flutter/src/session/app_session.dart';
@@ -10,6 +12,14 @@ import 'package:http/testing.dart';
 import '../support/tenant_fixture.dart';
 
 void main() {
+  late GroupMemberAccessRegistry groupAccess;
+  setUp(() async {
+    groupAccess = GroupMemberAccessRegistry(organization: 1, userId: 'user-01');
+    await groupAccess.replace(
+      GroupMemberAccessSnapshot(snapshotId: '1', entries: const {}),
+    );
+  });
+
   test('App 消息搜索保留同名用户的机构维度并显示复合身份', () async {
     final requests = <http.Request>[];
     final api = AppApiClient(
@@ -32,7 +42,7 @@ void main() {
     expect(hits, hasLength(2));
     expect(hits.map((item) => item.senderUserId), ['same-user', 'same-user']);
     expect(hits.map((item) => item.senderOrganization), [901, 902]);
-    expect(hits.map((item) => item.messageSeq), [1, 1]);
+    expect(hits.map((item) => item.messageSeq), ['1', '1']);
     expect(hits.map((item) => item.senderIdentityLabel), [
       '机构 901 · same-user',
       '机构 902 · same-user',
@@ -205,6 +215,7 @@ void main() {
     for (final field in [
       'message_id',
       'conversation_id',
+      'conversation_type',
       'sender_organization',
       'sender_user_id',
       'message_type',
@@ -237,8 +248,9 @@ void main() {
     final cases = <String, List<Object?>>{
       'message_id': invalidIds,
       'conversation_id': invalidIds,
+      'conversation_type': [null, 0, 3, '2'],
       'message_type': invalidPositiveIntegers,
-      'message_seq': invalidPositiveIntegers,
+      'message_seq': [null, 0, 1, '0', '01', '18446744073709551616'],
       'content': [null, 7, <String, Object?>{}],
       'sent_at': ['', '   ', 7, <String, Object?>{}],
     };
@@ -269,6 +281,105 @@ void main() {
     expect(valid.last.content, isEmpty);
     api.close();
   });
+
+  test('搜索群命中必须存在访问 entry 且整批位于授权周期', () async {
+    final api = AppApiClient(
+      httpClient: MockClient(
+        (_) async => _searchResponse([
+          _row(901, 'sender', 'single-result'),
+          {
+            ..._row(901, 'sender', 'revoked-group-result'),
+            'conversation_id': 'group-1',
+            'conversation_type': 2,
+            'message_seq': '3',
+          },
+        ]),
+      ),
+    );
+    final service = AppModuleApiService(
+      tenant: tenantFixture(),
+      session: _session(),
+      apiClient: api,
+    );
+    await expectLater(service.searchMessages('hello'), throwsFormatException);
+
+    groupAccess.replace(
+      GroupMemberAccessSnapshot(
+        snapshotId: '2',
+        entries: {
+          'group-1': GroupMemberAccessEntry.fromJson({
+            'conversation_id': 'group-1',
+            'conversation_type': 2,
+            'access_version': '1',
+            'access_state': 'history_only',
+            'last_message_seq': '10',
+            'last_change_seq': '1',
+            'periods': [
+              {'period_no': '1', 'from_seq': '2', 'to_seq': '5'},
+            ],
+          }),
+        },
+      ),
+    );
+    final hits = await service.searchMessages('hello');
+    expect(hits, hasLength(2));
+    expect(hits.last.conversationType, 2);
+    api.close();
+  });
+
+  test('群搜索 HTTP 在响应交错中失效时丢弃整批结果', () async {
+    groupAccess.replace(
+      GroupMemberAccessSnapshot(
+        snapshotId: '3',
+        entries: {
+          'group-1': GroupMemberAccessEntry.fromJson({
+            'conversation_id': 'group-1',
+            'conversation_type': 2,
+            'access_version': '3',
+            'access_state': 'active',
+            'last_message_seq': '10',
+            'last_change_seq': '1',
+            'periods': [
+              {'period_no': '1', 'from_seq': '1', 'to_seq': null},
+            ],
+          }),
+        },
+      ),
+    );
+    final requestStarted = Completer<void>();
+    final response = Completer<http.Response>();
+    final api = AppApiClient(
+      httpClient: MockClient((_) {
+        requestStarted.complete();
+        return response.future;
+      }),
+    );
+    final service = AppModuleApiService(
+      tenant: tenantFixture(),
+      session: _session(),
+      apiClient: api,
+    );
+
+    final pending = service.searchMessages('group secret');
+    await requestStarted.future;
+    groupAccess.failClose();
+    response.complete(
+      _searchResponse([
+        {
+          ..._row(901, 'sender', 'group-result'),
+          'conversation_id': 'group-1',
+          'conversation_type': 2,
+          'message_seq': '3',
+        },
+      ]),
+    );
+
+    await expectLater(pending, throwsStateError);
+    await groupAccess.replace(
+      GroupMemberAccessSnapshot(snapshotId: '4', entries: const {}),
+    );
+    api.close();
+  });
 }
 
 Map<String, Object?> _row(
@@ -278,10 +389,11 @@ Map<String, Object?> _row(
 ) => {
   'message_id': messageId,
   'conversation_id': 'conversation-1',
+  'conversation_type': 1,
   'sender_organization': senderOrganization,
   'sender_user_id': senderUserId,
   'message_type': 1,
-  'message_seq': 1,
+  'message_seq': '1',
   'content': 'hello',
   'sent_at': '2026-07-20 12:00:00',
 };

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../app/app_theme.dart';
 import '../discovery/tenant_config.dart';
 import '../im/app_im_connection.dart';
+import '../im/group_member_access.dart';
 import '../media/app_media_picker.dart';
 import '../media/app_media_service.dart';
 import '../qr_login/app_qr_login_service.dart';
@@ -88,6 +89,9 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
       (event) {
         if (event.connectionStatus case final status?) {
           if (mounted) setState(() => _connectionStatus = status);
+          if (status != AppImConnectionStatus.connected) {
+            _hideAllGroupConversations();
+          }
           if (status == AppImConnectionStatus.connected) {
             final snapshot = _accessGate.reconcileConnectionSnapshot(
               current: widget.im.bootstrap.crossOrgAccessSnapshotId,
@@ -112,6 +116,16 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
         }
         if (event.accessChanged case final accessChanged?) {
           _applyAccessChanged(accessChanged);
+        }
+        if (event.groupAccessChanged case final changed?) {
+          _applyGroupAccessChanged(changed);
+        }
+        if (event.groupAccessSnapshot case final snapshot?) {
+          _reconcileGroupAccessSnapshot(
+            event.previousGroupAccessSnapshot,
+            snapshot,
+          );
+          unawaited(_load(showSpinner: false));
         }
         if (event.message case final message?) {
           if (event.command == 'push' || event.command == 'sync') {
@@ -141,6 +155,7 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
     if (_accessGate.isCrossOrganizationFailClosed) {
       _failCloseCrossOrganization();
     }
+    if (!widget.im.isGroupAccessReady) _hideAllGroupConversations();
     unawaited(_load());
   }
 
@@ -185,6 +200,13 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
       _pendingRestorePeerIdentities.removeAll(confirmedRestoreKeys);
       final visibleConversations = conversations
           .where((item) {
+            if (item.conversationType == 2) {
+              return widget.im.isGroupAccessReady &&
+                  widget.im.groupAccessSnapshot?.entries.containsKey(
+                        item.conversationId,
+                      ) ==
+                      true;
+            }
             final peer = item.peerUser;
             return peer == null ||
                 ((peer.organization == widget.session.organization ||
@@ -279,6 +301,121 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
     unawaited(_load(showSpinner: false));
   }
 
+  void _applyGroupAccessChanged(GroupMemberAccessChanged changed) {
+    _accessEpoch += 1;
+    _pendingDeliveryMessages.removeWhere(
+      (_, message) => message.conversationId == changed.entry.conversationId,
+    );
+    final visible = _conversations
+        .where((item) {
+          return item.conversationId != changed.entry.conversationId ||
+              changed.entry.accessState != GroupMemberAccessState.revoked;
+        })
+        .map((item) {
+          if (item.conversationId != changed.entry.conversationId ||
+              changed.entry.accessState != GroupMemberAccessState.historyOnly) {
+            return item;
+          }
+          final keepLastMessage = changed.entry.containsMessageSequence(
+            item.lastMessageSeq,
+          );
+          return AppImConversation(
+            conversationId: item.conversationId,
+            conversationType: item.conversationType,
+            title: item.title,
+            peerUser: item.peerUser,
+            lastMessageId: keepLastMessage ? item.lastMessageId : '',
+            lastMessageSeq: keepLastMessage ? item.lastMessageSeq : 0,
+            lastMessageSummary: keepLastMessage ? item.lastMessageSummary : '',
+            lastMessageTime: keepLastMessage ? item.lastMessageTime : '',
+            unreadCount: 0,
+            isPinned: item.isPinned,
+            isMuted: item.isMuted,
+            avatarUrl: item.avatarUrl,
+            isVirtual: item.isVirtual,
+          );
+        })
+        .toList(growable: false);
+    if (mounted) {
+      setState(() => _conversations = visible);
+      widget.onUnreadChanged?.call(
+        visible.fold(0, (total, item) => total + item.unreadCount),
+      );
+    }
+  }
+
+  void _reconcileGroupAccessSnapshot(
+    GroupMemberAccessSnapshot? previous,
+    GroupMemberAccessSnapshot next,
+  ) {
+    _accessEpoch += 1;
+    _pendingDeliveryMessages.removeWhere((_, message) {
+      if (message.conversationType != 2) return false;
+      final entry = next.entries[message.conversationId];
+      return entry == null ||
+          !entry.isActive ||
+          !entry.containsMessageSequence(message.messageSeq);
+    });
+    final visible = _conversations
+        .where(
+          (conversation) =>
+              conversation.conversationType != 2 ||
+              next.entries.containsKey(conversation.conversationId),
+        )
+        .map((conversation) {
+          if (conversation.conversationType != 2) return conversation;
+          final entry = next.entries[conversation.conversationId]!;
+          final previousEntry = previous?.entries[conversation.conversationId];
+          final keepLastMessage =
+              conversation.lastMessageSeq > 0 &&
+              entry.containsMessageSequence(conversation.lastMessageSeq);
+          final clearUnread =
+              !entry.isActive ||
+              !keepLastMessage ||
+              _groupAccessEntryShrank(previousEntry, entry);
+          return AppImConversation(
+            conversationId: conversation.conversationId,
+            conversationType: conversation.conversationType,
+            title: conversation.title,
+            peerUser: conversation.peerUser,
+            lastMessageId: keepLastMessage ? conversation.lastMessageId : '',
+            lastMessageSeq: keepLastMessage ? conversation.lastMessageSeq : 0,
+            lastMessageSummary: keepLastMessage
+                ? conversation.lastMessageSummary
+                : '',
+            lastMessageTime: keepLastMessage
+                ? conversation.lastMessageTime
+                : '',
+            unreadCount: clearUnread ? 0 : conversation.unreadCount,
+            isPinned: conversation.isPinned,
+            isMuted: conversation.isMuted,
+            avatarUrl: conversation.avatarUrl,
+            isVirtual: conversation.isVirtual,
+          );
+        })
+        .toList(growable: false);
+    if (!mounted) return;
+    setState(() => _conversations = visible);
+    widget.onUnreadChanged?.call(
+      visible.fold(0, (total, item) => total + item.unreadCount),
+    );
+  }
+
+  void _hideAllGroupConversations() {
+    _accessEpoch += 1;
+    _pendingDeliveryMessages.removeWhere(
+      (_, message) => message.conversationType == 2,
+    );
+    final visible = _conversations
+        .where((item) => item.conversationType != 2)
+        .toList(growable: false);
+    if (!mounted) return;
+    setState(() => _conversations = visible);
+    widget.onUnreadChanged?.call(
+      visible.fold(0, (total, item) => total + item.unreadCount),
+    );
+  }
+
   void _hidePeerConversation(String conversationId, String peerKey) {
     if (!mounted) return;
     setState(() {
@@ -310,6 +447,15 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
     )) {
       return;
     }
+    if (message.conversationType == 2) {
+      final entry =
+          widget.im.groupAccessSnapshot?.entries[message.conversationId];
+      if (!widget.im.isGroupAccessReady ||
+          entry?.isActive != true ||
+          !entry!.containsMessageSequence(message.messageSeq)) {
+        return;
+      }
+    }
     _pendingDeliveryMessages[message.messageId] = message;
     if (_pendingDeliveryMessages.length > 256) {
       _pendingDeliveryMessages.remove(_pendingDeliveryMessages.keys.first);
@@ -330,6 +476,16 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
       final message = entry.value;
       final conversation = byId[message.conversationId];
       if (conversation == null) continue;
+      if (conversation.conversationType == 2) {
+        final groupEntry =
+            widget.im.groupAccessSnapshot?.entries[conversation.conversationId];
+        if (!widget.im.isGroupAccessReady ||
+            groupEntry?.isActive != true ||
+            !groupEntry!.containsMessageSequence(message.messageSeq)) {
+          _pendingDeliveryMessages.remove(entry.key);
+          continue;
+        }
+      }
       final peer = conversation.peerUser;
       final isCrossOrganization =
           conversation.conversationType == 1 &&
@@ -677,6 +833,7 @@ final class _ConversationPageState extends State<ConversationPage> {
   bool _accessRevoked = false;
   bool _accessDeniedByEvent = false;
   bool _authoritativeAccessRefreshInFlight = false;
+  GroupMemberAccessEntry? _groupEntry;
   int _accessEpoch = 0;
   Future<void> _mutationQueue = Future<void>.value();
 
@@ -694,6 +851,13 @@ final class _ConversationPageState extends State<ConversationPage> {
         peer != null &&
         peer.organization != widget.session.organization;
   }
+
+  bool get _isGroupConversation => widget.conversation.conversationType == 2;
+  bool get _canWrite =>
+      !_accessRevoked &&
+      (!_isGroupConversation || _groupEntry?.isActive == true);
+  bool get _canReceiveRealtime =>
+      !_accessRevoked && (!_isGroupConversation || _groupEntry != null);
 
   bool _isCurrentUserMessage(AppImMessage message) =>
       message.senderOrganization == widget.session.organization &&
@@ -727,6 +891,16 @@ final class _ConversationPageState extends State<ConversationPage> {
       _resolvedConversationId = widget.conversation.conversationId;
     }
     _connectionStatus = widget.im.connectionStatus;
+    if (_isGroupConversation) {
+      _groupEntry = widget
+          .im
+          .groupAccessSnapshot
+          ?.entries[widget.conversation.conversationId];
+      if (!widget.im.isGroupAccessReady || _groupEntry == null) {
+        _accessRevoked = true;
+        _error = '群成员访问快照尚未就绪或会话已撤权';
+      }
+    }
     _accessGate = AppImAccessEventGate(
       widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
     );
@@ -755,6 +929,10 @@ final class _ConversationPageState extends State<ConversationPage> {
           if (mounted) setState(() => _connectionStatus = status);
           if (status != AppImConnectionStatus.connected) {
             _clearTypingState();
+            if (_isGroupConversation) {
+              _groupEntry = null;
+              _failCloseGroupAccess('IM 重连期间群访问暂不可用');
+            }
           }
           if (status == AppImConnectionStatus.connected &&
               _isCrossOrganizationConversation) {
@@ -795,8 +973,18 @@ final class _ConversationPageState extends State<ConversationPage> {
         if (event.accessChanged case final accessChanged?) {
           _applyAccessChanged(accessChanged);
         }
+        if (event.groupAccessChanged case final changed?) {
+          _applyGroupAccessChanged(changed);
+        }
+        if (event.groupAccessSnapshot case final snapshot?
+            when _isGroupConversation) {
+          _reconcileGroupAccessSnapshot(
+            event.previousGroupAccessSnapshot,
+            snapshot,
+          );
+        }
         final message = event.message;
-        if (!_accessRevoked &&
+        if (_canReceiveRealtime &&
             message != null &&
             (message.conversationId == _conversationId ||
                 (widget.conversation.isVirtual &&
@@ -866,6 +1054,112 @@ final class _ConversationPageState extends State<ConversationPage> {
     setState(() => _typingLabel = null);
   }
 
+  void _applyGroupAccessChanged(GroupMemberAccessChanged changed) {
+    if (!_isGroupConversation ||
+        changed.entry.conversationId != _conversationId) {
+      return;
+    }
+    _accessEpoch += 1;
+    _typingExpiry?.cancel();
+    _composer.clear();
+    _groupEntry = changed.entry.accessState == GroupMemberAccessState.revoked
+        ? null
+        : changed.entry;
+    if (_groupEntry == null) {
+      _failCloseGroupAccess('群会话访问已撤销');
+      return;
+    }
+    _trimToGroupPeriods();
+    if (mounted) {
+      setState(() {
+        _typingLabel = null;
+        _sending = false;
+      });
+    }
+  }
+
+  void _reconcileGroupAccessSnapshot(
+    GroupMemberAccessSnapshot? previous,
+    GroupMemberAccessSnapshot next,
+  ) {
+    final entry = next.entries[widget.conversation.conversationId];
+    _accessEpoch += 1;
+    if (!widget.im.isGroupAccessReady || entry == null) {
+      _groupEntry = null;
+      _failCloseGroupAccess('群会话访问已撤销');
+      return;
+    }
+    final previousEntry = previous?.entries[widget.conversation.conversationId];
+    final wasFailClosed = _accessRevoked;
+    _groupEntry = entry;
+    _typingExpiry?.cancel();
+    _composer.clear();
+    _trimToGroupPeriods();
+    if (entry.isHistoryOnly) {
+      _accessRevoked = false;
+      if (mounted) {
+        setState(() {
+          _typingLabel = null;
+          _sending = false;
+        });
+      }
+      unawaited(_loadInitial());
+      return;
+    }
+    final requiresAuthoritativeRestore =
+        wasFailClosed ||
+        previousEntry == null ||
+        _groupAccessEntryShrank(previousEntry, entry);
+    _accessRevoked = requiresAuthoritativeRestore;
+    if (mounted) {
+      setState(() {
+        _typingLabel = null;
+        _sending = false;
+      });
+    }
+    unawaited(_loadInitial(authoritativeRestore: requiresAuthoritativeRestore));
+  }
+
+  void _trimToGroupPeriods() {
+    final entry = _groupEntry;
+    if (entry == null) return;
+    _messages.removeWhere(
+      (_, message) => !entry.containsMessageSequence(message.messageSeq),
+    );
+    _deliveryStatuses.removeWhere(
+      (messageId, _) => !_messages.containsKey(messageId),
+    );
+    _readAcknowledged.removeWhere(
+      (messageId) => !_messages.containsKey(messageId),
+    );
+    _lastMessageChangeSequences.removeWhere(
+      (messageId, _) => !_messages.containsKey(messageId),
+    );
+    _lastConversationChangeSequence = 0;
+    _localReadSequence = 0;
+  }
+
+  void _failCloseGroupAccess(String message) {
+    _accessEpoch += 1;
+    _accessRevoked = true;
+    _typingExpiry?.cancel();
+    _composer.clear();
+    if (!mounted) return;
+    setState(() {
+      _messages.clear();
+      _deliveryStatuses.clear();
+      _readAcknowledged.clear();
+      _lastMessageChangeSequences.clear();
+      _lastConversationChangeSequence = 0;
+      _localReadSequence = 0;
+      _typingLabel = null;
+      _sending = false;
+      _loading = false;
+      _loadingOlder = false;
+      _error = message;
+    });
+  }
+
   String? _authoritativeConversationId(AppImMessagePage page) {
     final conversationId =
         _resolvedConversationId ??
@@ -889,6 +1183,7 @@ final class _ConversationPageState extends State<ConversationPage> {
       final page = await widget.messaging.fetchMessages(
         tenant: widget.tenant,
         session: widget.session,
+        conversationType: widget.conversation.conversationType,
         conversationId: _requestConversationId,
         peerOrganization: _resolvedConversationId == null
             ? widget.conversation.peerUser?.organization ?? 0
@@ -904,7 +1199,22 @@ final class _ConversationPageState extends State<ConversationPage> {
       final authoritativeConversationId = authoritativeRestore
           ? _authoritativeConversationId(page)
           : null;
-      if (!authoritativeRestore) _merge(page.messages, notify: false);
+      final authoritativeMessages = authoritativeRestore && _isGroupConversation
+          ? page.messages
+                .where((message) {
+                  final allowed =
+                      _groupEntry?.containsMessageSequence(
+                        message.messageSeq,
+                      ) ==
+                      true;
+                  if (!allowed) {
+                    throw const FormatException('权威群历史包含访问周期外消息');
+                  }
+                  return true;
+                })
+                .toList(growable: false)
+          : page.messages;
+      if (!authoritativeRestore) _merge(authoritativeMessages, notify: false);
       if (mounted) {
         setState(() {
           if (authoritativeRestore) {
@@ -913,12 +1223,12 @@ final class _ConversationPageState extends State<ConversationPage> {
             _messages
               ..clear()
               ..addEntries(
-                page.messages.map(
+                authoritativeMessages.map(
                   (message) => MapEntry(message.messageId, message),
                 ),
               );
             _deliveryStatuses.clear();
-            for (final message in page.messages) {
+            for (final message in authoritativeMessages) {
               if (message.deliveryStatus case final status?) {
                 _advanceDelivery(message.messageId, status);
               }
@@ -950,6 +1260,7 @@ final class _ConversationPageState extends State<ConversationPage> {
       final page = await widget.messaging.fetchMessages(
         tenant: widget.tenant,
         session: widget.session,
+        conversationType: widget.conversation.conversationType,
         conversationId: _requestConversationId,
         peerOrganization: _resolvedConversationId == null
             ? widget.conversation.peerUser?.organization ?? 0
@@ -979,9 +1290,9 @@ final class _ConversationPageState extends State<ConversationPage> {
   }
 
   Future<void> _markRead() async {
-    if (_accessRevoked || _messages.isEmpty) return;
+    if (!_canWrite || _messages.isEmpty) return;
     final accessEpoch = _accessEpoch;
-    bool accessIsCurrent() => !_accessRevoked && accessEpoch == _accessEpoch;
+    bool accessIsCurrent() => _canWrite && accessEpoch == _accessEpoch;
     final conversationId = _resolvedConversationId;
     if (conversationId == null || conversationId.isEmpty) return;
     try {
@@ -1011,6 +1322,7 @@ final class _ConversationPageState extends State<ConversationPage> {
         await widget.messaging.markRead(
           tenant: widget.tenant,
           session: widget.session,
+          conversationType: widget.conversation.conversationType,
           conversationId: conversationId,
         );
       }
@@ -1021,6 +1333,7 @@ final class _ConversationPageState extends State<ConversationPage> {
         await widget.messaging.markRead(
           tenant: widget.tenant,
           session: widget.session,
+          conversationType: widget.conversation.conversationType,
           conversationId: conversationId,
         );
       } on Object {
@@ -1033,7 +1346,7 @@ final class _ConversationPageState extends State<ConversationPage> {
 
   Future<void> _send() async {
     final text = _composer.text.trim();
-    if (text.isEmpty || _sending || _accessRevoked) return;
+    if (text.isEmpty || _sending || !_canWrite) return;
     final accessEpoch = _accessEpoch;
     setState(() {
       _sending = true;
@@ -1063,7 +1376,7 @@ final class _ConversationPageState extends State<ConversationPage> {
   }
 
   Future<void> _sendMedia(AppMediaKind kind) async {
-    if (_sending || _accessRevoked) return;
+    if (_sending || !_canWrite) return;
     final accessEpoch = _accessEpoch;
     final picked = await widget.mediaPicker.pick(kind);
     if (picked == null ||
@@ -1083,6 +1396,9 @@ final class _ConversationPageState extends State<ConversationPage> {
         tenant: widget.tenant,
         session: widget.session,
         kind: kind,
+        conversationType: widget.conversation.conversationType,
+        conversationId:
+            _resolvedConversationId ?? widget.conversation.conversationId,
         filePath: picked.path,
         filename: picked.filename,
         size: picked.size,
@@ -1112,7 +1428,7 @@ final class _ConversationPageState extends State<ConversationPage> {
   }
 
   Future<void> _showAttachmentPicker() async {
-    if (_accessRevoked) return;
+    if (!_canWrite) return;
     final accessEpoch = _accessEpoch;
     final kind = await showModalBottomSheet<AppMediaKind>(
       context: context,
@@ -1147,6 +1463,7 @@ final class _ConversationPageState extends State<ConversationPage> {
   void _onComposerChanged(String value) {
     if (value.trim().isEmpty ||
         _accessRevoked ||
+        !_canWrite ||
         _connectionStatus != AppImConnectionStatus.connected) {
       return;
     }
@@ -1167,7 +1484,7 @@ final class _ConversationPageState extends State<ConversationPage> {
 
   Future<void> _sendScreenshot() async {
     final conversationId = _resolvedConversationId;
-    if (_accessRevoked || conversationId == null || conversationId.isEmpty) {
+    if (!_canWrite || conversationId == null || conversationId.isEmpty) {
       return;
     }
     final accessEpoch = _accessEpoch;
@@ -1185,7 +1502,7 @@ final class _ConversationPageState extends State<ConversationPage> {
   }
 
   Future<void> _showMessageActions(AppImMessage message) async {
-    if (_accessRevoked || message.status != 'normal') return;
+    if (!_canWrite || message.status != 'normal') return;
     final accessEpoch = _accessEpoch;
     final outgoing = _isCurrentUserMessage(message);
     final action = await showModalBottomSheet<String>(
@@ -1324,6 +1641,10 @@ final class _ConversationPageState extends State<ConversationPage> {
       if (!_securityContext(expectedConversationId).acceptsMessage(message)) {
         continue;
       }
+      if (_isGroupConversation &&
+          _groupEntry?.containsMessageSequence(message.messageSeq) != true) {
+        continue;
+      }
       if (_resolvedConversationId == null &&
           message.conversationId.isNotEmpty) {
         widget.im.registerConversationIdentities([
@@ -1343,7 +1664,7 @@ final class _ConversationPageState extends State<ConversationPage> {
 
   void _applyReceipt(AppImReceipt receipt) {
     final message = _messages[receipt.messageId];
-    if (_accessRevoked ||
+    if (!_canReceiveRealtime ||
         message == null ||
         receipt.conversationId != _conversationId ||
         receipt.messageSeq != message.messageSeq ||
@@ -1388,7 +1709,7 @@ final class _ConversationPageState extends State<ConversationPage> {
 
   void _applyConversationRead(AppImConversationReadState read) {
     final lastReadMessage = _messages[read.lastReadMessageId];
-    if (_accessRevoked ||
+    if (!_canReceiveRealtime ||
         read.conversationId != _conversationId ||
         (lastReadMessage != null &&
             read.lastReadSeq != lastReadMessage.messageSeq)) {
@@ -1429,7 +1750,7 @@ final class _ConversationPageState extends State<ConversationPage> {
   }
 
   Future<void> _applyMutation(AppImMessageMutation mutation) async {
-    if (_accessRevoked || mutation.conversationId != _conversationId) {
+    if (!_canReceiveRealtime || mutation.conversationId != _conversationId) {
       return;
     }
     final security = _securityContext(_conversationId);
@@ -1777,7 +2098,7 @@ final class _ConversationPageState extends State<ConversationPage> {
 
   void _applyTyping(AppImTypingState typing) {
     if (_connectionStatus != AppImConnectionStatus.connected ||
-        _accessRevoked ||
+        !_canWrite ||
         typing.conversationId != _conversationId ||
         (typing.actorOrganization == widget.session.organization &&
             typing.actorUserId == widget.session.user.userId)) {
@@ -1837,6 +2158,7 @@ final class _ConversationPageState extends State<ConversationPage> {
             onPressed:
                 _resolvedConversationId == null ||
                     _accessRevoked ||
+                    !_canWrite ||
                     _connectionStatus != AppImConnectionStatus.connected
                 ? null
                 : _sendScreenshot,
@@ -1929,6 +2251,7 @@ final class _ConversationPageState extends State<ConversationPage> {
                     onPressed:
                         _sending ||
                             _accessRevoked ||
+                            !_canWrite ||
                             _connectionStatus != AppImConnectionStatus.connected
                         ? null
                         : _showAttachmentPicker,
@@ -1940,7 +2263,7 @@ final class _ConversationPageState extends State<ConversationPage> {
                     child: TextField(
                       key: const ValueKey('message-composer'),
                       controller: _composer,
-                      enabled: !_accessRevoked,
+                      enabled: _canWrite,
                       onChanged: _onComposerChanged,
                       minLines: 1,
                       maxLines: 4,
@@ -1957,6 +2280,7 @@ final class _ConversationPageState extends State<ConversationPage> {
                     onPressed:
                         _sending ||
                             _accessRevoked ||
+                            !_canWrite ||
                             _connectionStatus != AppImConnectionStatus.connected
                         ? null
                         : _send,
@@ -1976,6 +2300,23 @@ final class _ConversationPageState extends State<ConversationPage> {
       ),
     );
   }
+}
+
+bool _groupAccessEntryShrank(
+  GroupMemberAccessEntry? previous,
+  GroupMemberAccessEntry next,
+) {
+  if (previous == null) return false;
+  if (previous.isActive && !next.isActive) return true;
+  for (final oldPeriod in previous.periods) {
+    final retained = next.periods.any(
+      (newPeriod) =>
+          newPeriod.periodNo == oldPeriod.periodNo &&
+          newPeriod.containsPeriod(oldPeriod),
+    );
+    if (!retained) return true;
+  }
+  return false;
 }
 
 final class _MessageBubble extends StatelessWidget {
@@ -2098,8 +2439,10 @@ final class _AssetMessageContentState extends State<_AssetMessageContent> {
     tenant: widget.tenant,
     session: widget.session,
     fileId: widget.message.assetFileId,
+    conversationType: widget.message.conversationType,
     conversationId: widget.message.conversationId,
     messageId: widget.message.messageId,
+    messageSeq: widget.message.messageSeq,
   );
 
   Future<void> _download() async {
@@ -2110,8 +2453,10 @@ final class _AssetMessageContentState extends State<_AssetMessageContent> {
         tenant: widget.tenant,
         session: widget.session,
         fileId: widget.message.assetFileId,
+        conversationType: widget.message.conversationType,
         conversationId: widget.message.conversationId,
         messageId: widget.message.messageId,
+        messageSeq: widget.message.messageSeq,
         filename: widget.message.assetName,
       );
       if (mounted) {
