@@ -721,13 +721,19 @@ final class _ToggleContacts extends _FakeContacts {
 
   bool failFetch = false;
   int handleCount = 0;
+  int contactsFetchCount = 0;
+  int requestsFetchCount = 0;
+  Completer<void>? contactsBarrier;
+  Completer<void>? requestsBarrier;
 
   @override
   Future<List<AppContact>> fetchContacts({
     required TenantConfig tenant,
     required AppSession session,
     String keyword = '',
-  }) {
+  }) async {
+    contactsFetchCount += 1;
+    await contactsBarrier?.future;
     if (failFetch) throw StateError('authoritative contacts refresh failed');
     return super.fetchContacts(
       tenant: tenant,
@@ -740,7 +746,9 @@ final class _ToggleContacts extends _FakeContacts {
   Future<List<AppFriendRequest>> fetchFriendRequests({
     required TenantConfig tenant,
     required AppSession session,
-  }) {
+  }) async {
+    requestsFetchCount += 1;
+    await requestsBarrier?.future;
     if (failFetch) throw StateError('authoritative requests refresh failed');
     return super.fetchFriendRequests(tenant: tenant, session: session);
   }
@@ -964,6 +972,34 @@ AppImEvent _crossOrgAccessEvent(String snapshotId, bool allowed) => AppImEvent(
     peerUserId: 'external-01',
   ),
 );
+
+AppImEvent _friendControlEvent(String eventId, String event) {
+  final created = event == 'created';
+  final accepted = event == 'accepted';
+  final changed = AppImFriendRequestChanged(
+    eventId: eventId,
+    event: event,
+    requestId: 30,
+    status: created ? 1 : (accepted ? 2 : 3),
+    fromOrganization: created ? 2 : 1,
+    fromUserId: created ? 'external-01' : 'user-01',
+    toOrganization: created ? 1 : 2,
+    toUserId: created ? 'user-01' : 'external-01',
+    targetOrganization: 1,
+    targetUserId: 'user-01',
+    actorOrganization: 2,
+    actorUserId: 'external-01',
+    crossOrgAccessSnapshotId: '1',
+    createTime: '2026-07-21 10:00:00',
+    handleTime: created ? null : '2026-07-21 10:01:00',
+  );
+  return AppImEvent(
+    command: 'friend_request',
+    message: null,
+    eventId: eventId,
+    friendRequest: changed,
+  );
+}
 
 void main() {
   testWidgets('连接异常不会向用户暴露内部错误', (tester) async {
@@ -1725,6 +1761,74 @@ void main() {
     expect(find.text('变更前'), findsOneWidget);
     expect(find.text('失败时不得覆盖'), findsNothing);
     expect(find.textContaining('authoritative refresh failed'), findsOneWidget);
+  });
+
+  testWidgets('好友事件、resume 与 reconnect 串行合并权威联系人和申请快照', (tester) async {
+    final im = _FakeImRuntime();
+    final tenant = tenantFixture();
+    final contacts = _ToggleContacts(
+      contacts: const [_externalContact],
+      requests: const [_externalFriendRequest],
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ContactsPage(
+          tenant: tenant,
+          session: _testSession(tenant),
+          im: im,
+          contacts: contacts,
+          messaging: _FakeMessaging(),
+          media: _UnusedMedia(),
+          mediaPicker: _UnusedMediaPicker(),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(contacts.contactsFetchCount, 1);
+    expect(contacts.requestsFetchCount, 1);
+
+    contacts.contactsBarrier = Completer<void>();
+    contacts.requestsBarrier = Completer<void>();
+    im.controller.add(_friendControlEvent('71'.padLeft(64, '0'), 'accepted'));
+    im.controller.add(_friendControlEvent('72'.padLeft(64, '0'), 'created'));
+    im.controller.add(_friendControlEvent('73'.padLeft(64, '0'), 'rejected'));
+    await tester.pump();
+    expect(contacts.contactsFetchCount, 2);
+    expect(contacts.requestsFetchCount, 2);
+
+    contacts.contactsBarrier!.complete();
+    contacts.requestsBarrier!.complete();
+    await tester.pumpAndSettle();
+    expect(contacts.contactsFetchCount, 3);
+    expect(contacts.requestsFetchCount, 3);
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(contacts.contactsFetchCount, 4);
+    expect(contacts.requestsFetchCount, 4);
+
+    im.emitConnectionStatus(AppImConnectionStatus.reconnecting);
+    im.emitConnectionStatus(AppImConnectionStatus.connected);
+    await tester.pumpAndSettle();
+    expect(contacts.contactsFetchCount, 5);
+    expect(contacts.requestsFetchCount, 5);
+
+    contacts.failFetch = true;
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(contacts.contactsFetchCount, 6);
+    expect(contacts.requestsFetchCount, 6);
+    expect(find.text('通讯录暂时不可用，请稍后重试'), findsOneWidget);
+
+    contacts.failFetch = false;
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(contacts.contactsFetchCount, 7);
+    expect(contacts.requestsFetchCount, 7);
+    expect(find.byKey(const ValueKey('contact-2-external-01')), findsOneWidget);
   });
 
   testWidgets('无会话时跨机构撤权仍即时清除好友与搜索入口', (tester) async {

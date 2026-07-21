@@ -187,6 +187,150 @@ void main() {
     harness.api.close();
   });
 
+  test('好友 created/accepted/rejected 严格消费、重复去重且乱序仅触发首次事件', () async {
+    final harness = await _connectSocket(_MessagingSocket());
+    final socket = harness.connection.socket as _MessagingSocket;
+    final events = <AppImFriendRequestChanged>[];
+    final subscription = harness.connection.events.listen((event) {
+      if (event.friendRequest case final changed?) events.add(changed);
+    });
+    final accepted = _friendRequestPacket(
+      eventId: _friendEventId(61),
+      event: 'accepted',
+    );
+    final created = _friendRequestPacket(
+      eventId: _friendEventId(62),
+      event: 'created',
+    );
+    final rejected = _friendRequestPacket(
+      eventId: _friendEventId(63),
+      event: 'rejected',
+    );
+
+    socket.pushRaw(accepted);
+    socket.pushRaw(created);
+    socket.pushRaw(created);
+    socket.pushRaw(rejected);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(events.map((event) => event.event), [
+      'accepted',
+      'created',
+      'rejected',
+    ]);
+    expect(events.map((event) => event.status), [2, 1, 3]);
+    expect(events[0].targetUserId, 'user-01');
+    expect(events[1].actorUserId, 'peer-01');
+    expect(events[2].handleTime, isNotNull);
+
+    await subscription.cancel();
+    await harness.connection.close();
+    harness.api.close();
+  });
+
+  test('好友同机构事件要求 snapshot 显式 null', () {
+    final event = AppImFriendRequestChanged.fromData(
+      _friendRequestPacket(
+        eventId: _friendEventId(64),
+        event: 'created',
+        sameOrganization: true,
+      )['data'],
+      expectedOrganization: 1,
+      expectedUserId: 'user-01',
+      expectedAccessSnapshotId: '1',
+    );
+    expect(event.crossOrgAccessSnapshotId, isNull);
+    expect(event.fromOrganization, 1);
+  });
+
+  test('好友 event_id 有界去重跨 reconnect 不重复触发刷新事件', () async {
+    final first = _MessagingSocket(clientId: 'friend-client-1');
+    final second = _MessagingSocket(clientId: 'friend-client-2');
+    final connected = await _connectRuntime([first, second]);
+    final events = <String>[];
+    final subscription = connected.runtime.events.listen((event) {
+      if (event.friendRequest != null) events.add(event.eventId!);
+    });
+    final duplicate = _friendRequestPacket(
+      eventId: _friendEventId(75),
+      event: 'created',
+    );
+
+    first.pushRaw(duplicate);
+    await Future<void>.delayed(Duration.zero);
+    final reconnected = connected.runtime.events.firstWhere(
+      (event) => event.connectionStatus == AppImConnectionStatus.connected,
+    );
+    await first.remoteClose();
+    await reconnected.timeout(const Duration(seconds: 2));
+    second.pushRaw(duplicate);
+    second.pushRaw(
+      _friendRequestPacket(eventId: _friendEventId(76), event: 'rejected'),
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    expect(events, [_friendEventId(75), _friendEventId(76)]);
+    await subscription.cancel();
+    await connected.runtime.close();
+    connected.api.close();
+  });
+
+  test('好友非法 event/home/target/同名复合身份/snapshot/展示字段均失败关闭', () async {
+    final invalidPackets = <Map<String, Object?>>[
+      _friendRequestPacket(eventId: 'not-64hex', event: 'created'),
+      {
+        ..._friendRequestPacket(eventId: _friendEventId(65), event: 'created'),
+        'organization': 2,
+      },
+      _friendRequestPacket(
+        eventId: _friendEventId(66),
+        event: 'created',
+        dataOverrides: {'target_user_id': 'same-name'},
+      ),
+      _friendRequestPacket(
+        eventId: _friendEventId(67),
+        event: 'created',
+        dataOverrides: {
+          'target_organization': '2',
+          'target_user_id': 'user-01',
+        },
+      ),
+      _friendRequestPacket(
+        eventId: _friendEventId(68),
+        event: 'created',
+        dataOverrides: {'cross_org_access_snapshot_id': '01'},
+      ),
+      _friendRequestPacket(eventId: _friendEventId(69), event: 'unknown'),
+      _friendRequestPacket(
+        eventId: _friendEventId(70),
+        event: 'created',
+        dataOverrides: {'from_user': <String, Object?>{}},
+      ),
+      _friendRequestPacket(
+        eventId: _friendEventId(71),
+        event: 'created',
+        dataOverrides: {'from_user_id': 'peer|01'},
+      ),
+    ];
+
+    for (final packet in invalidPackets) {
+      final harness = await _connectSocket(_MessagingSocket());
+      final socket = harness.connection.socket as _MessagingSocket;
+      final errors = <Object>[];
+      final subscription = harness.connection.events.listen(
+        (_) {},
+        onError: errors.add,
+      );
+      socket.pushRaw(packet);
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      expect(errors, contains(isA<FormatException>()), reason: '$packet');
+      expect(socket.closed, isTrue, reason: '$packet');
+      await subscription.cancel();
+      harness.api.close();
+    }
+  });
+
   test('consumer 成功后连接关闭会使等待中的 high-water/cursor 提交失效', () async {
     final cursor = _MemoryCursor('0', blockAccessWriteCall: 2);
     final harness = await _connectSocket(
@@ -3134,6 +3278,49 @@ Map<String, Object?> _orderedGroupPacket(
     _ => throw ArgumentError.value(command, 'command'),
   };
   return {'cmd': command, 'organization': 1, 'data': data};
+}
+
+String _friendEventId(int seed) => seed.toRadixString(16).padLeft(64, '0');
+
+Map<String, Object?> _friendRequestPacket({
+  required String eventId,
+  required String event,
+  bool sameOrganization = false,
+  Map<String, Object?> dataOverrides = const {},
+}) {
+  final created = event == 'created';
+  final fromOrganization = created ? (sameOrganization ? '1' : '2') : '1';
+  final fromUserId = created ? 'peer-01' : 'user-01';
+  final toOrganization = created ? '1' : (sameOrganization ? '1' : '2');
+  final toUserId = created ? 'user-01' : 'peer-01';
+  final status = switch (event) {
+    'created' => 1,
+    'accepted' => 2,
+    'rejected' => 3,
+    _ => 1,
+  };
+  return {
+    'cmd': 'friend_request',
+    'organization': 1,
+    'data': {
+      'event_id': eventId,
+      'event': event,
+      'request_id': 77,
+      'status': status,
+      'from_organization': fromOrganization,
+      'from_user_id': fromUserId,
+      'to_organization': toOrganization,
+      'to_user_id': toUserId,
+      'target_organization': '1',
+      'target_user_id': 'user-01',
+      'actor_organization': created ? fromOrganization : toOrganization,
+      'actor_user_id': created ? fromUserId : toUserId,
+      'cross_org_access_snapshot_id': sameOrganization ? null : '1',
+      'create_time': '2026-07-21 10:00:00',
+      'handle_time': created ? null : '2026-07-21 10:01:00',
+      ...dataOverrides,
+    },
+  };
 }
 
 Map<String, Object?> _message({

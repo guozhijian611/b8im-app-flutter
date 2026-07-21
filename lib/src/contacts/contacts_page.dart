@@ -52,7 +52,8 @@ final class ContactsPage extends StatefulWidget {
   State<ContactsPage> createState() => _ContactsPageState();
 }
 
-final class _ContactsPageState extends State<ContactsPage> {
+final class _ContactsPageState extends State<ContactsPage>
+    with WidgetsBindingObserver {
   final _searchController = TextEditingController();
   List<AppContact> _contacts = const [];
   List<AppFriendRequest> _requests = const [];
@@ -63,6 +64,9 @@ final class _ContactsPageState extends State<ContactsPage> {
   late final AppImAccessEventGate _accessGate;
   final Set<String> _revokedPeerIdentities = {};
   final Set<String> _pendingRestorePeerIdentities = {};
+  final Set<String> _queuedRestorePeerIdentities = {};
+  Future<void>? _loadTask;
+  bool _loadAgain = false;
   int _accessEpoch = 0;
 
   List<AppContact> get _filtered {
@@ -83,6 +87,7 @@ final class _ContactsPageState extends State<ContactsPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _accessGate = AppImAccessEventGate(
       widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
     );
@@ -92,6 +97,9 @@ final class _ContactsPageState extends State<ContactsPage> {
     );
     _eventSubscription = widget.im.events.listen(
       (event) {
+        if (event.friendRequest != null) {
+          unawaited(_load());
+        }
         if (event.accessChanged case final accessChanged?) {
           _applyAccessChanged(accessChanged);
         }
@@ -134,12 +142,46 @@ final class _ContactsPageState extends State<ContactsPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     unawaited(_eventSubscription?.cancel());
     _searchController.dispose();
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_load());
+    }
+  }
+
   Future<void> _load({String? restoringPeerKey}) async {
+    if (restoringPeerKey != null) {
+      _queuedRestorePeerIdentities.add(restoringPeerKey);
+    }
+    final running = _loadTask;
+    if (running != null) {
+      _loadAgain = true;
+      return running;
+    }
+    late final Future<void> task;
+    task = _drainLoads().whenComplete(() {
+      if (identical(_loadTask, task)) _loadTask = null;
+    });
+    _loadTask = task;
+    return task;
+  }
+
+  Future<void> _drainLoads() async {
+    do {
+      _loadAgain = false;
+      final restoringPeerKeys = Set<String>.of(_queuedRestorePeerIdentities);
+      _queuedRestorePeerIdentities.clear();
+      await _loadOnce(restoringPeerKeys: restoringPeerKeys);
+    } while (_loadAgain);
+  }
+
+  Future<void> _loadOnce({required Set<String> restoringPeerKeys}) async {
     final accessEpoch = _accessEpoch;
     if (mounted) {
       setState(() {
@@ -161,9 +203,7 @@ final class _ContactsPageState extends State<ContactsPage> {
       final contacts = results[0] as List<AppContact>;
       final requests = results[1] as List<AppFriendRequest>;
       if (accessEpoch != _accessEpoch) return;
-      if (restoringPeerKey != null) {
-        _pendingRestorePeerIdentities.add(restoringPeerKey);
-      }
+      _pendingRestorePeerIdentities.addAll(restoringPeerKeys);
       final confirmedRestoreKeys = <String>{
         for (final contact in contacts)
           _contactIdentityKey(contact.organization, contact.userId),
@@ -813,7 +853,8 @@ final class FriendRequestsPage extends StatefulWidget {
   State<FriendRequestsPage> createState() => _FriendRequestsPageState();
 }
 
-final class _FriendRequestsPageState extends State<FriendRequestsPage> {
+final class _FriendRequestsPageState extends State<FriendRequestsPage>
+    with WidgetsBindingObserver {
   List<AppFriendRequest> _requests = const [];
   bool _loading = true;
   String? _error;
@@ -821,11 +862,15 @@ final class _FriendRequestsPageState extends State<FriendRequestsPage> {
   late final AppImAccessEventGate _accessGate;
   final Set<String> _revokedPeerIdentities = {};
   final Set<String> _pendingRestorePeerIdentities = {};
+  final Set<String> _queuedRestorePeerIdentities = {};
+  Future<void>? _loadTask;
+  bool _loadAgain = false;
   int _accessEpoch = 0;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _accessGate = AppImAccessEventGate(
       widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
     );
@@ -835,6 +880,9 @@ final class _FriendRequestsPageState extends State<FriendRequestsPage> {
     );
     _eventSubscription = widget.im.events.listen(
       (event) {
+        if (event.friendRequest != null) {
+          unawaited(_load());
+        }
         if (event.connectionStatus == AppImConnectionStatus.connected) {
           final snapshot = _accessGate.reconcileConnectionSnapshot(
             current: widget.im.bootstrap.crossOrgAccessSnapshotId,
@@ -956,12 +1004,49 @@ final class _FriendRequestsPageState extends State<FriendRequestsPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     unawaited(_eventSubscription?.cancel());
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_load());
+    }
+  }
+
   Future<void> _load({String? restoringPeerKey}) async {
+    if (restoringPeerKey != null) {
+      _queuedRestorePeerIdentities.add(restoringPeerKey);
+    }
+    final running = _loadTask;
+    if (running != null) {
+      _loadAgain = true;
+      return running;
+    }
+    late final Future<void> task;
+    task = _drainRequestLoads().whenComplete(() {
+      if (identical(_loadTask, task)) _loadTask = null;
+    });
+    _loadTask = task;
+    return task;
+  }
+
+  Future<void> _drainRequestLoads() async {
+    do {
+      _loadAgain = false;
+      final restoringPeerKeys = Set<String>.of(_queuedRestorePeerIdentities);
+      _queuedRestorePeerIdentities.clear();
+      await _loadRequestsOnce(restoringPeerKeys: restoringPeerKeys);
+    } while (_loadAgain);
+  }
+
+  Future<void> _loadRequestsOnce({
+    required Set<String> restoringPeerKeys,
+  }) async {
     final accessEpoch = _accessEpoch;
+    if (!mounted) return;
     setState(() {
       _loading = true;
       _error = null;
@@ -972,9 +1057,7 @@ final class _FriendRequestsPageState extends State<FriendRequestsPage> {
         session: widget.session,
       );
       if (accessEpoch != _accessEpoch) return;
-      if (restoringPeerKey != null) {
-        _pendingRestorePeerIdentities.add(restoringPeerKey);
-      }
+      _pendingRestorePeerIdentities.addAll(restoringPeerKeys);
       final confirmedRestoreKeys = result
           .map(
             (request) =>

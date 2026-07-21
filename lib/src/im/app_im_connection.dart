@@ -47,6 +47,7 @@ final class AppImEvent {
     this.conversationRead,
     this.mutation,
     this.typing,
+    this.friendRequest,
     this.accessChanged,
     this.groupAccessChanged,
     this.previousGroupAccessSnapshot,
@@ -61,11 +62,187 @@ final class AppImEvent {
   final AppImConversationReadState? conversationRead;
   final AppImMessageMutation? mutation;
   final AppImTypingState? typing;
+  final AppImFriendRequestChanged? friendRequest;
   final AppImConversationAccessChanged? accessChanged;
   final GroupMemberAccessChanged? groupAccessChanged;
   final GroupMemberAccessSnapshot? previousGroupAccessSnapshot;
   final GroupMemberAccessSnapshot? groupAccessSnapshot;
   final AppImConnectionStatus? connectionStatus;
+}
+
+final class AppImFriendRequestChanged {
+  const AppImFriendRequestChanged({
+    required this.eventId,
+    required this.event,
+    required this.requestId,
+    required this.status,
+    required this.fromOrganization,
+    required this.fromUserId,
+    required this.toOrganization,
+    required this.toUserId,
+    required this.targetOrganization,
+    required this.targetUserId,
+    required this.actorOrganization,
+    required this.actorUserId,
+    required this.crossOrgAccessSnapshotId,
+    required this.createTime,
+    required this.handleTime,
+  });
+
+  factory AppImFriendRequestChanged.fromData(
+    Object? value, {
+    required int expectedOrganization,
+    required String expectedUserId,
+    required String expectedAccessSnapshotId,
+  }) {
+    final data = imMap(value, 'friend_request.data');
+    const fields = {
+      'event_id',
+      'event',
+      'request_id',
+      'status',
+      'from_organization',
+      'from_user_id',
+      'to_organization',
+      'to_user_id',
+      'target_organization',
+      'target_user_id',
+      'actor_organization',
+      'actor_user_id',
+      'cross_org_access_snapshot_id',
+      'create_time',
+      'handle_time',
+    };
+    if (data.keys.toSet().difference(fields).isNotEmpty ||
+        fields.difference(data.keys.toSet()).isNotEmpty) {
+      throw const FormatException('friend_request.data 字段无效');
+    }
+    final eventId = _canonicalFriendString(data['event_id']);
+    final event = _canonicalFriendString(data['event']);
+    final requestId = data['request_id'];
+    final status = data['status'];
+    final fromOrganization = _canonicalFriendDecimal(data['from_organization']);
+    final fromUserId = _canonicalFriendUserId(data['from_user_id']);
+    final toOrganization = _canonicalFriendDecimal(data['to_organization']);
+    final toUserId = _canonicalFriendUserId(data['to_user_id']);
+    final targetOrganization = _canonicalFriendDecimal(
+      data['target_organization'],
+    );
+    final targetUserId = _canonicalFriendUserId(data['target_user_id']);
+    final actorOrganization = _canonicalFriendDecimal(
+      data['actor_organization'],
+    );
+    final actorUserId = _canonicalFriendUserId(data['actor_user_id']);
+    final crossOrganization = fromOrganization != toOrganization;
+    final rawSnapshotId = data['cross_org_access_snapshot_id'];
+    final snapshotId = rawSnapshotId == null
+        ? null
+        : _canonicalFriendDecimal(rawSnapshotId);
+    final createTime = _canonicalFriendTime(data['create_time']);
+    final rawHandleTime = data['handle_time'];
+    final handleTime = rawHandleTime == null
+        ? null
+        : _canonicalFriendTime(rawHandleTime);
+    if (!RegExp(r'^[a-f0-9]{64}$').hasMatch(eventId) ||
+        requestId is! int ||
+        requestId <= 0 ||
+        requestId > 9007199254740991 ||
+        status is! int ||
+        !const {1, 2, 3}.contains(status) ||
+        targetOrganization != '$expectedOrganization' ||
+        targetUserId != expectedUserId ||
+        (crossOrganization
+            ? snapshotId == null || snapshotId != expectedAccessSnapshotId
+            : snapshotId != null)) {
+      throw const FormatException('friend_request.data 业务身份无效');
+    }
+    final created = event == 'created';
+    final accepted = event == 'accepted';
+    final rejected = event == 'rejected';
+    if ((!created && !accepted && !rejected) ||
+        (created &&
+            (status != 1 ||
+                targetOrganization != toOrganization ||
+                targetUserId != toUserId ||
+                actorOrganization != fromOrganization ||
+                actorUserId != fromUserId ||
+                handleTime != null)) ||
+        ((accepted || rejected) &&
+            (status != (accepted ? 2 : 3) ||
+                targetOrganization != fromOrganization ||
+                targetUserId != fromUserId ||
+                actorOrganization != toOrganization ||
+                actorUserId != toUserId ||
+                handleTime == null))) {
+      throw const FormatException('friend_request.data 状态迁移无效');
+    }
+    return AppImFriendRequestChanged(
+      eventId: eventId,
+      event: event,
+      requestId: requestId,
+      status: status,
+      fromOrganization: int.parse(fromOrganization),
+      fromUserId: fromUserId,
+      toOrganization: int.parse(toOrganization),
+      toUserId: toUserId,
+      targetOrganization: int.parse(targetOrganization),
+      targetUserId: targetUserId,
+      actorOrganization: int.parse(actorOrganization),
+      actorUserId: actorUserId,
+      crossOrgAccessSnapshotId: snapshotId,
+      createTime: createTime,
+      handleTime: handleTime,
+    );
+  }
+
+  final String eventId;
+  final String event;
+  final int requestId;
+  final int status;
+  final int fromOrganization;
+  final String fromUserId;
+  final int toOrganization;
+  final String toUserId;
+  final int targetOrganization;
+  final String targetUserId;
+  final int actorOrganization;
+  final String actorUserId;
+  final String? crossOrgAccessSnapshotId;
+  final String createTime;
+  final String? handleTime;
+}
+
+String _canonicalFriendString(Object? value) {
+  if (value is! String || value.isEmpty || value.trim() != value) {
+    throw const FormatException('friend_request string 不是 canonical');
+  }
+  return value;
+}
+
+String _canonicalFriendDecimal(Object? value) {
+  final result = normalizeGroupAccessPositiveDecimal(value);
+  if (result.isEmpty) {
+    throw const FormatException('friend_request decimal 不是 canonical');
+  }
+  return result;
+}
+
+String _canonicalFriendUserId(Object? value) {
+  final result = canonicalGroupAccessId(value);
+  if (result.isEmpty) {
+    throw const FormatException('friend_request user_id 不是 canonical');
+  }
+  return result;
+}
+
+String _canonicalFriendTime(Object? value) {
+  final result = _canonicalFriendString(value);
+  if (!RegExp(
+    r'^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01]) (?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$',
+  ).hasMatch(result)) {
+    throw const FormatException('friend_request time 不是 canonical');
+  }
+  return result;
 }
 
 abstract interface class AppImRuntime {
@@ -1857,6 +2034,25 @@ final class AppImConnection implements AppImRuntime {
         );
         return;
       }
+      if (command == 'friend_request') {
+        final changed = AppImFriendRequestChanged.fromData(
+          packet['data'],
+          expectedOrganization: tenant.organization,
+          expectedUserId: session.user.userId,
+          expectedAccessSnapshotId: _accessSnapshots.latestSnapshotId,
+        );
+        if (!_seenEventIds.add(changed.eventId)) return;
+        _trimSeenEvents();
+        _events.add(
+          AppImEvent(
+            command: command,
+            message: null,
+            eventId: changed.eventId,
+            friendRequest: changed,
+          ),
+        );
+        return;
+      }
       if (command == 'conversation.access_changed') {
         final accessChanged = AppImConversationAccessChanged.fromJson(
           packet['data'],
@@ -2305,6 +2501,7 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
       StreamController<AppImEvent>.broadcast(sync: true);
   final LinkedHashMap<String, AppImConversationAccessChanged>
   _recentAccessChanges = LinkedHashMap();
+  final LinkedHashSet<String> _seenFriendRequestEventIds = LinkedHashSet();
   final AppImAccessSnapshotTracker _accessSnapshots =
       AppImAccessSnapshotTracker('');
   AppImConnection? _active;
@@ -2430,6 +2627,12 @@ final class _ReconnectingAppImRuntime implements AppImRuntime {
     _active = connection;
     _activeSubscription = connection.events.listen(
       (event) {
+        if (event.friendRequest case final friendRequest?) {
+          if (!_seenFriendRequestEventIds.add(friendRequest.eventId)) return;
+          if (_seenFriendRequestEventIds.length > 2048) {
+            _seenFriendRequestEventIds.remove(_seenFriendRequestEventIds.first);
+          }
+        }
         if (event.accessChanged case final accessChanged?) {
           if (!_rememberAccessChange(accessChanged)) return;
         }
