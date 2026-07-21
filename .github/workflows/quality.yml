@@ -13,7 +13,25 @@ permissions:
   contents: read
 
 jobs:
+  format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Flutter app
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: b8im-app-flutter
+          persist-credentials: false
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          cache: true
+      - run: dart format --output=none --set-exit-if-changed lib test
+        working-directory: b8im-app-flutter
+
   analyze-and-test:
+    needs: format
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -26,22 +44,23 @@ jobs:
             exit 1
           fi
       - name: Checkout Flutter app
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: b8im-app-flutter
+          persist-credentials: false
       - name: Checkout file media path dependency
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: guozhijian611/b8im-module-file-media
           token: ${{ secrets.B8IM_CI_READ_TOKEN }}
           path: b8im-module-file-media
-      - uses: subosito/flutter-action@v2
+          ref: 2ad2bf51eaf4d8a56c48d91782782017701c992a
+          persist-credentials: false
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           channel: stable
           cache: true
       - run: flutter pub get
-        working-directory: b8im-app-flutter
-      - run: dart format --output=none --set-exit-if-changed lib test
         working-directory: b8im-app-flutter
       - run: dart analyze
         working-directory: b8im-app-flutter
