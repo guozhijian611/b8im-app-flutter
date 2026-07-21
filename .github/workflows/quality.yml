@@ -26,7 +26,7 @@ jobs:
         with:
           channel: stable
           cache: true
-      - run: dart format --output=none --set-exit-if-changed lib test
+      - run: dart format --output=none --set-exit-if-changed lib test tool
         working-directory: b8im-app-flutter
 
   analyze-and-test:

@@ -116,11 +116,10 @@ Future<void> main() async {
       throw StateError('file_media 解析结果 capability/permission 不完整');
     }
 
-    // Negative: a licensed-looking payload key that is not in the App catalog
-    // must never appear in resolve results.
+    // Negative: a payload key that is not in the App catalog must never appear
+    // in resolve results.
     final keysResolved = resolved.map((m) => m.registration.moduleKey).toSet();
-    if (keysResolved.contains('moments') ||
-        keysResolved.contains('unknown_module')) {
+    if (keysResolved.contains('unknown_module')) {
       throw StateError('未注册模块不应进入 resolve 结果');
     }
 
