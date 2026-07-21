@@ -54,7 +54,7 @@ jobs:
           repository: guozhijian611/b8im-module-file-media
           token: ${{ secrets.B8IM_CI_READ_TOKEN }}
           path: b8im-module-file-media
-          ref: 2ad2bf51eaf4d8a56c48d91782782017701c992a
+          ref: 3e56e2e2a533df82a87f7e8c3af21fe72a108226
           persist-credentials: false
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
