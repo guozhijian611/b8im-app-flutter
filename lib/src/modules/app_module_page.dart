@@ -337,8 +337,9 @@ final class _AppModulePageState extends State<AppModulePage> {
       return value
           .map(
             (item) => _Card(
-              title: item.senderUserId,
-              subtitle: '${item.content}\n${item.sentAt}',
+              title: item.senderIdentityLabel,
+              subtitle:
+                  '${item.content}\n${item.sentAt ?? item.conversationId}',
             ),
           )
           .toList();

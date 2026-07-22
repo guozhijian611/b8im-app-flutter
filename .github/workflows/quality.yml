@@ -1,0 +1,68 @@
+name: quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: flutter-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Flutter app
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: b8im-app-flutter
+          persist-credentials: false
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          cache: true
+      - run: dart format --output=none --set-exit-if-changed lib test tool
+        working-directory: b8im-app-flutter
+
+  analyze-and-test:
+    needs: format
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require private module read token
+        env:
+          B8IM_CI_READ_TOKEN: ${{ secrets.B8IM_CI_READ_TOKEN }}
+        run: |
+          if [ -z "$B8IM_CI_READ_TOKEN" ]; then
+            echo "B8IM_CI_READ_TOKEN must read the private b8im-module-file-media repository." >&2
+            exit 1
+          fi
+      - name: Checkout Flutter app
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: b8im-app-flutter
+          persist-credentials: false
+      - name: Checkout file media path dependency
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: guozhijian611/b8im-module-file-media
+          token: ${{ secrets.B8IM_CI_READ_TOKEN }}
+          path: b8im-module-file-media
+          ref: 3e56e2e2a533df82a87f7e8c3af21fe72a108226
+          persist-credentials: false
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+        working-directory: b8im-app-flutter
+      - run: dart analyze
+        working-directory: b8im-app-flutter
+      - run: flutter test
+        working-directory: b8im-app-flutter

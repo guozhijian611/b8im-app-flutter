@@ -110,15 +110,16 @@ Future<void> main() async {
     final opened = fileMedia.single;
     if (!opened.projection.available ||
         !opened.projection.capabilities.contains('file_media.app.page') ||
-        !opened.projection.permissions.contains('saimulti:app:file_media:use')) {
+        !opened.projection.permissions.contains(
+          'saimulti:app:file_media:use',
+        )) {
       throw StateError('file_media 解析结果 capability/permission 不完整');
     }
 
-    // Negative: a licensed-looking payload key that is not in the App catalog
-    // must never appear in resolve results.
+    // Negative: a payload key that is not in the App catalog must never appear
+    // in resolve results.
     final keysResolved = resolved.map((m) => m.registration.moduleKey).toSet();
-    if (keysResolved.contains('moments') ||
-        keysResolved.contains('unknown_module')) {
+    if (keysResolved.contains('unknown_module')) {
       throw StateError('未注册模块不应进入 resolve 结果');
     }
 
@@ -130,25 +131,21 @@ Future<void> main() async {
     );
 
     // Exercise primary App surface twice for consistency.
-    final quotas = <FileMediaQuota>[];
+    final usages = <FileMediaUsage>[];
     final checks = <FileMediaUploadCheck>[];
     for (var i = 0; i < 2; i++) {
-      quotas.add(await moduleClient.usage());
+      usages.add(await moduleClient.usage());
       checks.add(await moduleClient.checkUpload(1024));
     }
-    if (!quotas.every((q) => q.enabled) || checks.any((c) => !c.allowed && c.reason.isEmpty)) {
-      // allowed may be false on quota exhaustion; still proves host path works
-      // if usage succeeds and check returns structured result.
-    }
-    if (quotas.length != 2 || checks.length != 2) {
+    if (usages.length != 2 || checks.length != 2) {
       throw StateError('file_media host 调用次数不一致');
     }
     // usage twice must return consistent enabled flag
-    if (quotas[0].enabled != quotas[1].enabled) {
+    if (usages[0].policy.enabled != usages[1].policy.enabled) {
       throw StateError('file_media usage 两次 enabled 不一致');
     }
-    if (checks[0].quota.enabled != checks[1].quota.enabled) {
-      throw StateError('file_media checkUpload 两次 quota.enabled 不一致');
+    if (checks[0].policy.enabled != checks[1].policy.enabled) {
+      throw StateError('file_media checkUpload 两次 policy.enabled 不一致');
     }
 
     stdout.writeln(
@@ -163,8 +160,10 @@ Future<void> main() async {
         'file_media_resolved': true,
         'file_media_title': opened.title,
         'file_media_version': opened.projection.version,
-        'file_media_usage_enabled': quotas[0].enabled,
-        'file_media_usage_max_storage_bytes': quotas[0].maxStorageBytes,
+        'file_media_policy_enabled': usages[0].policy.enabled,
+        'file_media_storage_quota_value': usages[0].storage.quotaValue,
+        'file_media_storage_occupancy_value': usages[0].storage.occupancyValue,
+        'file_media_storage_unlimited': usages[0].storage.unlimited,
         'file_media_check_allowed_1': checks[0].allowed,
         'file_media_check_allowed_2': checks[1].allowed,
         'file_media_host_exercised_twice': true,

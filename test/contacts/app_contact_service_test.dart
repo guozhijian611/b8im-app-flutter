@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:b8im_app_flutter/src/contacts/app_contact_models.dart';
 import 'package:b8im_app_flutter/src/contacts/app_contact_service.dart';
 import 'package:b8im_app_flutter/src/network/app_api_client.dart';
 import 'package:b8im_app_flutter/src/session/app_session.dart';
@@ -17,6 +18,10 @@ void main() {
         requests.add(request);
         final user = {
           'id': 2,
+          'organization': 2,
+          'organization_name': '外部机构',
+          'company_name': '外部公司',
+          'is_cross_organization': true,
           'user_id': 'peer-01',
           'account': 'peer',
           'nickname': '测试好友',
@@ -40,6 +45,8 @@ void main() {
               'status_text': '待处理',
               'create_time': '2026-07-17 10:00:00',
               'handle_time': '',
+              'from_organization': 2,
+              'to_organization': 1,
               'from_user': user,
               'to_user': null,
             },
@@ -76,17 +83,38 @@ void main() {
     final message = await service.sendFriendRequest(
       tenant: tenant,
       session: session,
+      organization: 2,
       userId: 'peer-01',
       message: '我是验收用户',
     );
     await service.handleFriendRequest(
       tenant: tenant,
       session: session,
-      requestId: 7,
+      request: friendRequests.single,
       accept: true,
     );
+    await expectLater(
+      service.handleFriendRequest(
+        tenant: tenant,
+        session: session,
+        request: AppFriendRequest(
+          id: 8,
+          direction: 'incoming',
+          message: '',
+          status: 1,
+          statusText: '待处理',
+          createTime: '',
+          fromOrganization: 2,
+          toOrganization: 99,
+          fromUser: friendRequests.single.fromUser,
+          toUser: null,
+        ),
+        accept: true,
+      ),
+      throwsA(isA<FormatException>()),
+    );
 
-    expect(contacts.single.displayName, '测试好友');
+    expect(contacts.single.displayName, '测试好友 · 外部公司');
     expect(friendRequests.single.isPendingIncoming, isTrue);
     expect(users.single.userId, 'peer-01');
     expect(message, '好友申请已发送');
@@ -98,8 +126,39 @@ void main() {
     }
     expect(requests[2].url.queryParameters['keyword'], '测试');
     expect(jsonDecode(requests[3].body)['to_user_id'], 'peer-01');
-    expect(jsonDecode(requests[4].body), {'id': 7, 'action': 'accept'});
+    expect(jsonDecode(requests[3].body)['to_organization'], 2);
+    expect(jsonDecode(requests[4].body), {
+      'id': 7,
+      'action': 'accept',
+      'from_organization': 2,
+      'to_organization': 1,
+    });
     api.close();
+  });
+
+  test('好友申请缺少顶层机构或用户机构不一致时 fail-closed', () {
+    expect(
+      () => AppFriendRequest.fromJson({
+        'id': 7,
+        'direction': 'incoming',
+        'status': 1,
+        'from_user': null,
+        'to_user': null,
+      }),
+      throwsA(isA<FormatException>()),
+    );
+    expect(
+      () => AppFriendRequest.fromJson({
+        'id': 7,
+        'direction': 'incoming',
+        'status': 1,
+        'from_organization': 3,
+        'to_organization': 1,
+        'from_user': {'organization': 2, 'user_id': 'peer-01'},
+        'to_user': null,
+      }),
+      throwsA(isA<FormatException>()),
+    );
   });
 }
 

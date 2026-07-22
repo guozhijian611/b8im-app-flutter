@@ -1,6 +1,12 @@
+import '../messaging/contact_display_label.dart';
+
 final class AppContact {
   const AppContact({
     required this.id,
+    required this.organization,
+    required this.organizationName,
+    required this.companyName,
+    required this.isCrossOrganization,
     required this.userId,
     required this.account,
     required this.nickname,
@@ -17,9 +23,19 @@ final class AppContact {
   factory AppContact.fromJson(Object? value, {String field = 'contact'}) {
     final map = contactMap(value, field);
     final userId = contactString(map['user_id']);
-    if (userId.isEmpty) throw FormatException('$field.user_id 格式无效');
+    final organization = contactInt(map['organization']);
+    if (userId.isEmpty || organization <= 0) {
+      throw FormatException('$field 复合身份格式无效');
+    }
     return AppContact(
       id: contactString(map['id']),
+      organization: organization,
+      organizationName: contactString(map['organization_name']),
+      companyName: contactString(
+        map['company_name'],
+        fallback: contactString(map['organization_name']),
+      ),
+      isCrossOrganization: contactBool(map['is_cross_organization']),
       userId: userId,
       account: contactString(map['account']),
       nickname: contactString(map['nickname']),
@@ -35,6 +51,10 @@ final class AppContact {
   }
 
   final String id;
+  final int organization;
+  final String organizationName;
+  final String companyName;
+  final bool isCrossOrganization;
   final String userId;
   final String account;
   final String nickname;
@@ -47,13 +67,12 @@ final class AppContact {
   final String relationStatus;
   final bool isSystem;
 
-  String get displayName => remark.isNotEmpty
-      ? remark
-      : nickname.isNotEmpty
-      ? nickname
-      : account.isNotEmpty
-      ? account
-      : '未命名用户';
+  String get displayName => ContactDisplayLabel.format(
+    nickname: remark.isNotEmpty ? remark : nickname,
+    account: account,
+    companyName: companyName,
+    isCrossOrganization: isCrossOrganization,
+  );
 
   String get subtitle => signature.isNotEmpty
       ? signature
@@ -72,6 +91,8 @@ final class AppFriendRequest {
     required this.status,
     required this.statusText,
     required this.createTime,
+    required this.fromOrganization,
+    required this.toOrganization,
     required this.fromUser,
     required this.toUser,
   });
@@ -81,8 +102,20 @@ final class AppFriendRequest {
     final id = contactInt(map['id']);
     final status = contactInt(map['status']);
     final direction = contactString(map['direction']);
+    final fromOrganization = contactInt(map['from_organization']);
+    final toOrganization = contactInt(map['to_organization']);
+    final fromUser = map['from_user'] == null
+        ? null
+        : AppContact.fromJson(map['from_user'], field: 'from_user');
+    final toUser = map['to_user'] == null
+        ? null
+        : AppContact.fromJson(map['to_user'], field: 'to_user');
     if (id <= 0 ||
         status < 0 ||
+        fromOrganization <= 0 ||
+        toOrganization <= 0 ||
+        (fromUser != null && fromUser.organization != fromOrganization) ||
+        (toUser != null && toUser.organization != toOrganization) ||
         !{'incoming', 'outgoing'}.contains(direction)) {
       throw const FormatException('好友申请格式无效');
     }
@@ -93,12 +126,10 @@ final class AppFriendRequest {
       status: status,
       statusText: contactString(map['status_text']),
       createTime: contactString(map['create_time']),
-      fromUser: map['from_user'] == null
-          ? null
-          : AppContact.fromJson(map['from_user'], field: 'from_user'),
-      toUser: map['to_user'] == null
-          ? null
-          : AppContact.fromJson(map['to_user'], field: 'to_user'),
+      fromOrganization: fromOrganization,
+      toOrganization: toOrganization,
+      fromUser: fromUser,
+      toUser: toUser,
     );
   }
 
@@ -108,10 +139,22 @@ final class AppFriendRequest {
   final int status;
   final String statusText;
   final String createTime;
+  final int fromOrganization;
+  final int toOrganization;
   final AppContact? fromUser;
   final AppContact? toUser;
 
   AppContact? get displayUser => direction == 'incoming' ? fromUser : toUser;
+  int get peerOrganization =>
+      direction == 'incoming' ? fromOrganization : toOrganization;
+  bool hasAuthoritativeContext(int currentOrganization) {
+    final user = displayUser;
+    if (user == null || user.organization != peerOrganization) return false;
+    return direction == 'incoming'
+        ? toOrganization == currentOrganization
+        : fromOrganization == currentOrganization;
+  }
+
   bool get isPendingIncoming => direction == 'incoming' && status == 1;
 }
 

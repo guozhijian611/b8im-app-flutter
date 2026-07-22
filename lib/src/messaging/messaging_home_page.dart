@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../app/app_theme.dart';
 import '../discovery/tenant_config.dart';
 import '../im/app_im_connection.dart';
+import '../im/group_member_access.dart';
 import '../media/app_media_picker.dart';
 import '../media/app_media_service.dart';
 import '../qr_login/app_qr_login_service.dart';
@@ -12,6 +13,9 @@ import '../qr_login/web_login_scanner_page.dart';
 import '../session/app_session.dart';
 import 'app_im_models.dart';
 import 'app_messaging_service.dart';
+
+String _identityKey(int organization, String userId) =>
+    '$organization:${userId.trim()}';
 
 final class MessagingHomePage extends StatefulWidget {
   const MessagingHomePage({
@@ -52,26 +56,106 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
   String? _error;
   bool _loading = true;
   late AppImConnectionStatus _connectionStatus;
+  late final AppImAccessEventGate _accessGate;
+  final Set<String> _revokedPeerIdentities = {};
+  final Set<String> _pendingRestorePeerIdentities = {};
+  final Map<String, AppImMessage> _pendingDeliveryMessages = {};
+  final Set<String> _deliveryAckInFlight = {};
+  int _accessEpoch = 0;
+
+  AppImConversationIdentityContext _identityFor(
+    AppImConversation conversation,
+  ) => AppImConversationIdentityContext(
+    organization: widget.session.organization,
+    userId: widget.session.user.userId,
+    conversationId: conversation.conversationId,
+    conversationType: conversation.conversationType,
+    peerOrganization: conversation.peerUser?.organization,
+    peerUserId: conversation.peerUser?.userId,
+  );
 
   @override
   void initState() {
     super.initState();
     _connectionStatus = widget.im.connectionStatus;
+    _accessGate = AppImAccessEventGate(
+      widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+    );
+    _accessGate.reconcileConnectionSnapshot(
+      current: widget.im.bootstrap.crossOrgAccessSnapshotId,
+      highestPositive: widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+    );
     _eventSubscription = widget.im.events.listen(
       (event) {
         if (event.connectionStatus case final status?) {
           if (mounted) setState(() => _connectionStatus = status);
+          if (status != AppImConnectionStatus.connected) {
+            _hideAllGroupConversations();
+          }
+          if (status == AppImConnectionStatus.connected) {
+            final snapshot = _accessGate.reconcileConnectionSnapshot(
+              current: widget.im.bootstrap.crossOrgAccessSnapshotId,
+              highestPositive:
+                  widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+            );
+            if (snapshot == AppImAccessSnapshotObservation.invalid ||
+                snapshot == AppImAccessSnapshotObservation.stale ||
+                _accessGate.isCrossOrganizationFailClosed) {
+              _failCloseCrossOrganization();
+            } else {
+              _accessEpoch += 1;
+              _hideCrossOrganizationConversations();
+              _revokedPeerIdentities.clear();
+              _pendingRestorePeerIdentities.clear();
+              for (final accessChanged in widget.im.recentAccessChanges) {
+                _applyAccessChanged(accessChanged);
+              }
+              unawaited(_load(showSpinner: false));
+            }
+          }
+        }
+        if (event.accessChanged case final accessChanged?) {
+          _applyAccessChanged(accessChanged);
+        }
+        if (event.groupAccessChanged case final changed?) {
+          _applyGroupAccessChanged(changed);
+        }
+        if (event.groupAccessSnapshot case final snapshot?) {
+          _reconcileGroupAccessSnapshot(
+            event.previousGroupAccessSnapshot,
+            snapshot,
+          );
+          unawaited(_load(showSpinner: false));
+        }
+        if (event.message case final message?) {
+          if (event.command == 'push' || event.command == 'sync') {
+            _queueDelivery(message);
+          }
         }
         if (event.command == 'push' ||
             event.command == 'send_ack' ||
-            event.command == 'sync') {
+            event.command == 'sync' ||
+            event.command == 'ack' ||
+            event.command == 'conversation_read' ||
+            event.mutation != null) {
           unawaited(_load(showSpinner: false));
         }
       },
       onError: (Object error) {
-        if (mounted) setState(() => _error = error.toString());
+        if (isAppImAccessSnapshotFailure(error)) {
+          _failCloseCrossOrganization(error: error);
+        } else if (mounted) {
+          setState(() => _error = error.toString());
+        }
       },
     );
+    for (final accessChanged in widget.im.recentAccessChanges) {
+      _applyAccessChanged(accessChanged);
+    }
+    if (_accessGate.isCrossOrganizationFailClosed) {
+      _failCloseCrossOrganization();
+    }
+    if (!widget.im.isGroupAccessReady) _hideAllGroupConversations();
     unawaited(_load());
   }
 
@@ -82,7 +166,12 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
     super.dispose();
   }
 
-  Future<void> _load({bool showSpinner = true}) async {
+  Future<void> _load({
+    bool showSpinner = true,
+    String? restoringPeerKey,
+  }) async {
+    final accessEpoch = _accessEpoch;
+    final syncCursor = widget.im.bootstrap.nextGlobalSeq;
     if (showSpinner && mounted) {
       setState(() {
         _loading = true;
@@ -94,19 +183,388 @@ final class _MessagingHomePageState extends State<MessagingHomePage> {
         tenant: widget.tenant,
         session: widget.session,
       );
+      if (accessEpoch != _accessEpoch) return;
+      widget.im.registerConversationIdentities(
+        conversations.where((item) => !item.isVirtual).map(_identityFor),
+      );
+      if (restoringPeerKey != null) {
+        _pendingRestorePeerIdentities.add(restoringPeerKey);
+      }
+      final confirmedRestoreKeys = conversations
+          .map((item) => item.peerUser)
+          .whereType<AppImUserSummary>()
+          .map((peer) => _identityKey(peer.organization, peer.userId))
+          .where(_pendingRestorePeerIdentities.contains)
+          .toSet();
+      _revokedPeerIdentities.removeAll(confirmedRestoreKeys);
+      _pendingRestorePeerIdentities.removeAll(confirmedRestoreKeys);
+      final visibleConversations = conversations
+          .where((item) {
+            if (item.conversationType == 2) {
+              return widget.im.isGroupAccessReady &&
+                  widget.im.groupAccessSnapshot?.entries.containsKey(
+                        item.conversationId,
+                      ) ==
+                      true;
+            }
+            final peer = item.peerUser;
+            return peer == null ||
+                ((peer.organization == widget.session.organization ||
+                        !_accessGate.isCrossOrganizationFailClosed) &&
+                    !_revokedPeerIdentities.contains(
+                      _identityKey(peer.organization, peer.userId),
+                    ));
+          })
+          .toList(growable: false);
       if (mounted) {
         setState(() {
-          _conversations = conversations;
+          _conversations = visibleConversations;
           _error = null;
         });
         widget.onUnreadChanged?.call(
-          conversations.fold(0, (total, item) => total + item.unreadCount),
+          visibleConversations.fold(
+            0,
+            (total, item) => total + item.unreadCount,
+          ),
         );
       }
+      final consumed = await widget.im.consumeGlobalSync(
+        nextGlobalSeq: syncCursor,
+        consumer: (messages) async {
+          if (accessEpoch != _accessEpoch) {
+            throw StateError('SYNC 消费期间访问 epoch 已变化');
+          }
+          for (final message in messages) {
+            _queueDelivery(message);
+          }
+        },
+      );
+      if (!consumed || accessEpoch != _accessEpoch) return;
+      unawaited(_acknowledgeAuthoritativeDeliveries(conversations));
     } on Object catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _error = error.toString());
+      }
     } finally {
-      if (showSpinner && mounted) setState(() => _loading = false);
+      if (showSpinner && mounted && accessEpoch == _accessEpoch) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  void _applyAccessChanged(AppImConversationAccessChanged accessChanged) {
+    if (!appImSameIdentity(
+          accessChanged.targetOrganization,
+          accessChanged.targetUserId,
+          widget.session.organization,
+          widget.session.user.userId,
+        ) ||
+        _accessGate.observe(accessChanged) != AppImAccessEventDecision.apply) {
+      return;
+    }
+    final peerKey = _identityKey(
+      accessChanged.peerOrganization,
+      accessChanged.peerUserId,
+    );
+    _accessEpoch += 1;
+    if (accessChanged.allowed) {
+      _pendingRestorePeerIdentities.add(peerKey);
+      _revokedPeerIdentities.add(peerKey);
+      _pendingDeliveryMessages.removeWhere(
+        (_, message) =>
+            message.conversationId == accessChanged.conversationId ||
+            appImSameIdentity(
+              message.senderOrganization,
+              message.senderId,
+              accessChanged.peerOrganization,
+              accessChanged.peerUserId,
+            ),
+      );
+      _hidePeerConversation(accessChanged.conversationId, peerKey);
+      unawaited(_load(showSpinner: false, restoringPeerKey: peerKey));
+      return;
+    } else {
+      _pendingRestorePeerIdentities.remove(peerKey);
+      _revokedPeerIdentities.add(peerKey);
+      _pendingDeliveryMessages.removeWhere(
+        (_, message) =>
+            message.conversationId == accessChanged.conversationId ||
+            appImSameIdentity(
+              message.senderOrganization,
+              message.senderId,
+              accessChanged.peerOrganization,
+              accessChanged.peerUserId,
+            ),
+      );
+      _hidePeerConversation(accessChanged.conversationId, peerKey);
+    }
+    unawaited(_load(showSpinner: false));
+  }
+
+  void _applyGroupAccessChanged(GroupMemberAccessChanged changed) {
+    _accessEpoch += 1;
+    _pendingDeliveryMessages.removeWhere(
+      (_, message) => message.conversationId == changed.entry.conversationId,
+    );
+    final visible = _conversations
+        .where((item) {
+          return item.conversationId != changed.entry.conversationId ||
+              changed.entry.accessState != GroupMemberAccessState.revoked;
+        })
+        .map((item) {
+          if (item.conversationId != changed.entry.conversationId ||
+              changed.entry.accessState != GroupMemberAccessState.historyOnly) {
+            return item;
+          }
+          final keepLastMessage = changed.entry.containsMessageSequence(
+            item.lastMessageSeq,
+          );
+          return AppImConversation(
+            conversationId: item.conversationId,
+            conversationType: item.conversationType,
+            title: item.title,
+            peerUser: item.peerUser,
+            lastMessageId: keepLastMessage ? item.lastMessageId : '',
+            lastMessageSeq: keepLastMessage ? item.lastMessageSeq : 0,
+            lastMessageSummary: keepLastMessage ? item.lastMessageSummary : '',
+            lastMessageTime: keepLastMessage ? item.lastMessageTime : '',
+            unreadCount: 0,
+            isPinned: item.isPinned,
+            isMuted: item.isMuted,
+            avatarUrl: item.avatarUrl,
+            isVirtual: item.isVirtual,
+          );
+        })
+        .toList(growable: false);
+    if (mounted) {
+      setState(() => _conversations = visible);
+      widget.onUnreadChanged?.call(
+        visible.fold(0, (total, item) => total + item.unreadCount),
+      );
+    }
+  }
+
+  void _reconcileGroupAccessSnapshot(
+    GroupMemberAccessSnapshot? previous,
+    GroupMemberAccessSnapshot next,
+  ) {
+    _accessEpoch += 1;
+    _pendingDeliveryMessages.removeWhere((_, message) {
+      if (message.conversationType != 2) return false;
+      final entry = next.entries[message.conversationId];
+      return entry == null ||
+          !entry.isActive ||
+          !entry.containsMessageSequence(message.messageSeq);
+    });
+    final visible = _conversations
+        .where(
+          (conversation) =>
+              conversation.conversationType != 2 ||
+              next.entries.containsKey(conversation.conversationId),
+        )
+        .map((conversation) {
+          if (conversation.conversationType != 2) return conversation;
+          final entry = next.entries[conversation.conversationId]!;
+          final previousEntry = previous?.entries[conversation.conversationId];
+          final keepLastMessage =
+              conversation.lastMessageSeq > 0 &&
+              entry.containsMessageSequence(conversation.lastMessageSeq);
+          final clearUnread =
+              !entry.isActive ||
+              !keepLastMessage ||
+              _groupAccessEntryShrank(previousEntry, entry);
+          return AppImConversation(
+            conversationId: conversation.conversationId,
+            conversationType: conversation.conversationType,
+            title: conversation.title,
+            peerUser: conversation.peerUser,
+            lastMessageId: keepLastMessage ? conversation.lastMessageId : '',
+            lastMessageSeq: keepLastMessage ? conversation.lastMessageSeq : 0,
+            lastMessageSummary: keepLastMessage
+                ? conversation.lastMessageSummary
+                : '',
+            lastMessageTime: keepLastMessage
+                ? conversation.lastMessageTime
+                : '',
+            unreadCount: clearUnread ? 0 : conversation.unreadCount,
+            isPinned: conversation.isPinned,
+            isMuted: conversation.isMuted,
+            avatarUrl: conversation.avatarUrl,
+            isVirtual: conversation.isVirtual,
+          );
+        })
+        .toList(growable: false);
+    if (!mounted) return;
+    setState(() => _conversations = visible);
+    widget.onUnreadChanged?.call(
+      visible.fold(0, (total, item) => total + item.unreadCount),
+    );
+  }
+
+  void _hideAllGroupConversations() {
+    _accessEpoch += 1;
+    _pendingDeliveryMessages.removeWhere(
+      (_, message) => message.conversationType == 2,
+    );
+    final visible = _conversations
+        .where((item) => item.conversationType != 2)
+        .toList(growable: false);
+    if (!mounted) return;
+    setState(() => _conversations = visible);
+    widget.onUnreadChanged?.call(
+      visible.fold(0, (total, item) => total + item.unreadCount),
+    );
+  }
+
+  void _hidePeerConversation(String conversationId, String peerKey) {
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _conversations = _conversations
+          .where(
+            (item) =>
+                item.conversationId != conversationId &&
+                (item.peerUser == null ||
+                    _identityKey(
+                          item.peerUser!.organization,
+                          item.peerUser!.userId,
+                        ) !=
+                        peerKey),
+          )
+          .toList(growable: false);
+    });
+    widget.onUnreadChanged?.call(
+      _conversations.fold(0, (total, item) => total + item.unreadCount),
+    );
+  }
+
+  void _queueDelivery(AppImMessage message) {
+    if (appImSameIdentity(
+      message.senderOrganization,
+      message.senderId,
+      widget.session.organization,
+      widget.session.user.userId,
+    )) {
+      return;
+    }
+    if (message.conversationType == 2) {
+      final entry =
+          widget.im.groupAccessSnapshot?.entries[message.conversationId];
+      if (!widget.im.isGroupAccessReady ||
+          entry?.isActive != true ||
+          !entry!.containsMessageSequence(message.messageSeq)) {
+        return;
+      }
+    }
+    _pendingDeliveryMessages[message.messageId] = message;
+    if (_pendingDeliveryMessages.length > 256) {
+      _pendingDeliveryMessages.remove(_pendingDeliveryMessages.keys.first);
+    }
+  }
+
+  Future<void> _acknowledgeAuthoritativeDeliveries(
+    List<AppImConversation> conversations,
+  ) async {
+    final accessEpoch = _accessEpoch;
+    final byId = {
+      for (final conversation in conversations)
+        conversation.conversationId: conversation,
+    };
+    for (final entry in List.of(_pendingDeliveryMessages.entries)) {
+      if (accessEpoch != _accessEpoch) return;
+      if (_deliveryAckInFlight.contains(entry.key)) continue;
+      final message = entry.value;
+      final conversation = byId[message.conversationId];
+      if (conversation == null) continue;
+      if (conversation.conversationType == 2) {
+        final groupEntry =
+            widget.im.groupAccessSnapshot?.entries[conversation.conversationId];
+        if (!widget.im.isGroupAccessReady ||
+            groupEntry?.isActive != true ||
+            !groupEntry!.containsMessageSequence(message.messageSeq)) {
+          _pendingDeliveryMessages.remove(entry.key);
+          continue;
+        }
+      }
+      final peer = conversation.peerUser;
+      final isCrossOrganization =
+          conversation.conversationType == 1 &&
+          peer != null &&
+          peer.organization != widget.session.organization;
+      if ((isCrossOrganization && _accessGate.isCrossOrganizationFailClosed) ||
+          (peer != null &&
+              _revokedPeerIdentities.contains(
+                _identityKey(peer.organization, peer.userId),
+              ))) {
+        _pendingDeliveryMessages.remove(entry.key);
+        continue;
+      }
+      final context = _identityFor(conversation);
+      if (!context.acceptsMessage(message)) {
+        _pendingDeliveryMessages.remove(entry.key);
+        continue;
+      }
+      _deliveryAckInFlight.add(entry.key);
+      try {
+        await widget.im.acknowledge(
+          message: message,
+          status: AppImDeliveryStatus.delivered,
+          identity: context,
+        );
+        if (accessEpoch != _accessEpoch) return;
+        _pendingDeliveryMessages.remove(entry.key);
+      } on Object {
+        // 保留待确认项，连接恢复或会话列表刷新后重试。
+      } finally {
+        _deliveryAckInFlight.remove(entry.key);
+      }
+    }
+  }
+
+  void _hideCrossOrganizationConversations() {
+    _pendingDeliveryMessages.removeWhere(
+      (_, message) => message.senderOrganization != widget.session.organization,
+    );
+    final visible = _conversations
+        .where(
+          (item) =>
+              item.peerUser == null ||
+              item.peerUser!.organization == widget.session.organization,
+        )
+        .toList(growable: false);
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _conversations = visible;
+    });
+    widget.onUnreadChanged?.call(
+      visible.fold(0, (total, item) => total + item.unreadCount),
+    );
+  }
+
+  void _failCloseCrossOrganization({Object? error}) {
+    _accessEpoch += 1;
+    _accessGate.resetSnapshot('0');
+    _pendingRestorePeerIdentities.clear();
+    _pendingDeliveryMessages.removeWhere(
+      (_, message) => message.senderOrganization != widget.session.organization,
+    );
+    final visible = _conversations
+        .where(
+          (item) =>
+              item.peerUser == null ||
+              item.peerUser!.organization == widget.session.organization,
+        )
+        .toList(growable: false);
+    if (mounted) {
+      setState(() {
+        _loading = false;
+        _conversations = visible;
+        if (error != null) _error = error.toString();
+      });
+      widget.onUnreadChanged?.call(
+        visible.fold(0, (total, item) => total + item.unreadCount),
+      );
     }
   }
 
@@ -356,7 +814,11 @@ final class _ConversationPageState extends State<ConversationPage> {
   final Map<String, AppImMessage> _messages = {};
   final Map<String, AppImDeliveryStatus> _deliveryStatuses = {};
   final Set<String> _readAcknowledged = {};
+  final Map<String, int> _lastMessageChangeSequences = {};
   StreamSubscription<AppImEvent>? _eventSubscription;
+  Timer? _typingExpiry;
+  String? _typingLabel;
+  DateTime? _lastTypingSentAt;
   String? _error;
   int _beforeSeq = 0;
   bool _hasMoreBefore = false;
@@ -364,7 +826,16 @@ final class _ConversationPageState extends State<ConversationPage> {
   bool _loadingOlder = false;
   bool _sending = false;
   late AppImConnectionStatus _connectionStatus;
+  late final AppImAccessEventGate _accessGate;
   String? _resolvedConversationId;
+  int _lastConversationChangeSequence = 0;
+  int _localReadSequence = 0;
+  bool _accessRevoked = false;
+  bool _accessDeniedByEvent = false;
+  bool _authoritativeAccessRefreshInFlight = false;
+  GroupMemberAccessEntry? _groupEntry;
+  int _accessEpoch = 0;
+  Future<void> _mutationQueue = Future<void>.value();
 
   String get _conversationId =>
       _resolvedConversationId ?? widget.conversation.conversationId;
@@ -373,6 +844,39 @@ final class _ConversationPageState extends State<ConversationPage> {
       widget.conversation.isVirtual && _resolvedConversationId == null
       ? ''
       : _conversationId;
+
+  bool get _isCrossOrganizationConversation {
+    final peer = widget.conversation.peerUser;
+    return widget.conversation.conversationType == 1 &&
+        peer != null &&
+        peer.organization != widget.session.organization;
+  }
+
+  bool get _isGroupConversation => widget.conversation.conversationType == 2;
+  bool get _canWrite =>
+      !_accessRevoked &&
+      (!_isGroupConversation || _groupEntry?.isActive == true);
+  bool get _canReceiveRealtime =>
+      !_accessRevoked && (!_isGroupConversation || _groupEntry != null);
+
+  bool _isCurrentUserMessage(AppImMessage message) =>
+      message.senderOrganization == widget.session.organization &&
+      message.senderId == widget.session.user.userId;
+
+  bool _isVirtualPeerMessage(AppImMessage message) =>
+      message.senderOrganization ==
+          widget.conversation.peerUser?.organization &&
+      message.senderId == widget.conversation.peerUser?.userId;
+
+  AppImConversationIdentityContext _securityContext(String conversationId) =>
+      AppImConversationIdentityContext(
+        organization: widget.session.organization,
+        userId: widget.session.user.userId,
+        conversationId: conversationId,
+        conversationType: widget.conversation.conversationType,
+        peerOrganization: widget.conversation.peerUser?.organization,
+        peerUserId: widget.conversation.peerUser?.userId,
+      );
 
   List<AppImMessage> get _orderedMessages {
     final values = _messages.values.toList();
@@ -387,10 +891,68 @@ final class _ConversationPageState extends State<ConversationPage> {
       _resolvedConversationId = widget.conversation.conversationId;
     }
     _connectionStatus = widget.im.connectionStatus;
+    if (_isGroupConversation) {
+      _groupEntry = widget
+          .im
+          .groupAccessSnapshot
+          ?.entries[widget.conversation.conversationId];
+      if (!widget.im.isGroupAccessReady || _groupEntry == null) {
+        _accessRevoked = true;
+        _error = '群成员访问快照尚未就绪或会话已撤权';
+      }
+    }
+    _accessGate = AppImAccessEventGate(
+      widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+    );
+    _accessGate.reconcileConnectionSnapshot(
+      current: widget.im.bootstrap.crossOrgAccessSnapshotId,
+      highestPositive: widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+    );
+    if (_resolvedConversationId case final conversationId?) {
+      try {
+        widget.im.registerConversationIdentities([
+          _securityContext(conversationId),
+        ]);
+      } on Object catch (error) {
+        _accessRevoked = true;
+        _error = error.toString();
+      }
+    }
+    if (_isCrossOrganizationConversation &&
+        _accessGate.isCrossOrganizationFailClosed) {
+      _accessRevoked = true;
+      _error = '跨机构访问暂不可用';
+    }
     _eventSubscription = widget.im.events.listen(
       (event) {
         if (event.connectionStatus case final status?) {
           if (mounted) setState(() => _connectionStatus = status);
+          if (status != AppImConnectionStatus.connected) {
+            _clearTypingState();
+            if (_isGroupConversation) {
+              _groupEntry = null;
+              _failCloseGroupAccess('IM 重连期间群访问暂不可用');
+            }
+          }
+          if (status == AppImConnectionStatus.connected &&
+              _isCrossOrganizationConversation) {
+            final snapshot = _accessGate.reconcileConnectionSnapshot(
+              current: widget.im.bootstrap.crossOrgAccessSnapshotId,
+              highestPositive:
+                  widget.im.bootstrap.highestCrossOrgAccessSnapshotId,
+            );
+            if (snapshot == AppImAccessSnapshotObservation.invalid ||
+                snapshot == AppImAccessSnapshotObservation.stale ||
+                _accessGate.isCrossOrganizationFailClosed) {
+              _failCloseCrossOrganization();
+            } else {
+              _prepareAuthoritativeAccessRefresh();
+              for (final accessChanged in widget.im.recentAccessChanges) {
+                _applyAccessChanged(accessChanged);
+              }
+              _requestAuthoritativeAccessRefresh();
+            }
+          }
         }
         if (event.receipt case final receipt?) {
           _applyReceipt(receipt);
@@ -398,32 +960,221 @@ final class _ConversationPageState extends State<ConversationPage> {
         if (event.conversationRead case final read?) {
           _applyConversationRead(read);
         }
+        if (event.mutation case final mutation?) {
+          final accessEpoch = _accessEpoch;
+          _mutationQueue = _mutationQueue.then((_) async {
+            if (accessEpoch != _accessEpoch) return;
+            await _applyMutation(mutation);
+          });
+        }
+        if (event.typing case final typing?) {
+          _applyTyping(typing);
+        }
+        if (event.accessChanged case final accessChanged?) {
+          _applyAccessChanged(accessChanged);
+        }
+        if (event.groupAccessChanged case final changed?) {
+          _applyGroupAccessChanged(changed);
+        }
+        if (event.groupAccessSnapshot case final snapshot?
+            when _isGroupConversation) {
+          _reconcileGroupAccessSnapshot(
+            event.previousGroupAccessSnapshot,
+            snapshot,
+          );
+        }
         final message = event.message;
-        if (message != null &&
+        if (_canReceiveRealtime &&
+            message != null &&
             (message.conversationId == _conversationId ||
                 (widget.conversation.isVirtual &&
-                    message.senderId ==
-                        widget.conversation.peerUser?.userId))) {
-          _merge([message]);
-          if (event.command == 'push') unawaited(_markRead());
+                    _isVirtualPeerMessage(message)))) {
+          final accepted = _merge([message]);
+          if (accepted && event.command == 'push') unawaited(_markRead());
         }
       },
       onError: (Object error) {
-        if (mounted) setState(() => _error = error.toString());
+        if (isAppImAccessSnapshotFailure(error) &&
+            _isCrossOrganizationConversation) {
+          _failCloseCrossOrganization(error: error);
+        } else if (mounted) {
+          setState(() => _error = error.toString());
+        }
       },
     );
-    unawaited(_loadInitial());
+    for (final accessChanged in widget.im.recentAccessChanges) {
+      _applyAccessChanged(accessChanged);
+    }
+    if (!_accessRevoked) unawaited(_loadInitial());
   }
 
   @override
   void dispose() {
     unawaited(_eventSubscription?.cancel());
+    _typingExpiry?.cancel();
     _composer.dispose();
     _scrollController.dispose();
     super.dispose();
   }
 
-  Future<void> _loadInitial() async {
+  void _prepareAuthoritativeAccessRefresh() {
+    _accessEpoch += 1;
+    _accessDeniedByEvent = false;
+    _authoritativeAccessRefreshInFlight = false;
+    _typingExpiry?.cancel();
+    _composer.clear();
+    if (!mounted) return;
+    setState(() {
+      _accessRevoked = true;
+      _messages.clear();
+      _deliveryStatuses.clear();
+      _readAcknowledged.clear();
+      _lastMessageChangeSequences.clear();
+      _lastConversationChangeSequence = 0;
+      _typingLabel = null;
+      _sending = false;
+      _error = null;
+    });
+  }
+
+  void _requestAuthoritativeAccessRefresh() {
+    if (_accessDeniedByEvent ||
+        _accessGate.isCrossOrganizationFailClosed ||
+        _authoritativeAccessRefreshInFlight ||
+        !mounted) {
+      return;
+    }
+    _authoritativeAccessRefreshInFlight = true;
+    unawaited(_loadInitial(authoritativeRestore: true));
+  }
+
+  void _clearTypingState() {
+    _typingExpiry?.cancel();
+    if (_typingLabel == null || !mounted) return;
+    setState(() => _typingLabel = null);
+  }
+
+  void _applyGroupAccessChanged(GroupMemberAccessChanged changed) {
+    if (!_isGroupConversation ||
+        changed.entry.conversationId != _conversationId) {
+      return;
+    }
+    _accessEpoch += 1;
+    _typingExpiry?.cancel();
+    _composer.clear();
+    _groupEntry = changed.entry.accessState == GroupMemberAccessState.revoked
+        ? null
+        : changed.entry;
+    if (_groupEntry == null) {
+      _failCloseGroupAccess('群会话访问已撤销');
+      return;
+    }
+    _trimToGroupPeriods();
+    if (mounted) {
+      setState(() {
+        _typingLabel = null;
+        _sending = false;
+      });
+    }
+  }
+
+  void _reconcileGroupAccessSnapshot(
+    GroupMemberAccessSnapshot? previous,
+    GroupMemberAccessSnapshot next,
+  ) {
+    final entry = next.entries[widget.conversation.conversationId];
+    _accessEpoch += 1;
+    if (!widget.im.isGroupAccessReady || entry == null) {
+      _groupEntry = null;
+      _failCloseGroupAccess('群会话访问已撤销');
+      return;
+    }
+    final previousEntry = previous?.entries[widget.conversation.conversationId];
+    final wasFailClosed = _accessRevoked;
+    _groupEntry = entry;
+    _typingExpiry?.cancel();
+    _composer.clear();
+    _trimToGroupPeriods();
+    if (entry.isHistoryOnly) {
+      _accessRevoked = false;
+      if (mounted) {
+        setState(() {
+          _typingLabel = null;
+          _sending = false;
+        });
+      }
+      unawaited(_loadInitial());
+      return;
+    }
+    final requiresAuthoritativeRestore =
+        wasFailClosed ||
+        previousEntry == null ||
+        _groupAccessEntryShrank(previousEntry, entry);
+    _accessRevoked = requiresAuthoritativeRestore;
+    if (mounted) {
+      setState(() {
+        _typingLabel = null;
+        _sending = false;
+      });
+    }
+    unawaited(_loadInitial(authoritativeRestore: requiresAuthoritativeRestore));
+  }
+
+  void _trimToGroupPeriods() {
+    final entry = _groupEntry;
+    if (entry == null) return;
+    _messages.removeWhere(
+      (_, message) => !entry.containsMessageSequence(message.messageSeq),
+    );
+    _deliveryStatuses.removeWhere(
+      (messageId, _) => !_messages.containsKey(messageId),
+    );
+    _readAcknowledged.removeWhere(
+      (messageId) => !_messages.containsKey(messageId),
+    );
+    _lastMessageChangeSequences.removeWhere(
+      (messageId, _) => !_messages.containsKey(messageId),
+    );
+    _lastConversationChangeSequence = 0;
+    _localReadSequence = 0;
+  }
+
+  void _failCloseGroupAccess(String message) {
+    _accessEpoch += 1;
+    _accessRevoked = true;
+    _typingExpiry?.cancel();
+    _composer.clear();
+    if (!mounted) return;
+    setState(() {
+      _messages.clear();
+      _deliveryStatuses.clear();
+      _readAcknowledged.clear();
+      _lastMessageChangeSequences.clear();
+      _lastConversationChangeSequence = 0;
+      _localReadSequence = 0;
+      _typingLabel = null;
+      _sending = false;
+      _loading = false;
+      _loadingOlder = false;
+      _error = message;
+    });
+  }
+
+  String? _authoritativeConversationId(AppImMessagePage page) {
+    final conversationId =
+        _resolvedConversationId ??
+        (page.messages.isEmpty ? null : page.messages.first.conversationId);
+    if (conversationId == null) return null;
+    final security = _securityContext(conversationId);
+    if (page.messages.any((message) => !security.acceptsMessage(message))) {
+      throw const FormatException('权威历史包含错误会话或复合身份消息');
+    }
+    return conversationId;
+  }
+
+  Future<void> _loadInitial({bool authoritativeRestore = false}) async {
+    if (_accessRevoked && !authoritativeRestore) return;
+    final accessEpoch = _accessEpoch;
     setState(() {
       _loading = true;
       _error = null;
@@ -432,14 +1183,57 @@ final class _ConversationPageState extends State<ConversationPage> {
       final page = await widget.messaging.fetchMessages(
         tenant: widget.tenant,
         session: widget.session,
+        conversationType: widget.conversation.conversationType,
         conversationId: _requestConversationId,
+        peerOrganization: _resolvedConversationId == null
+            ? widget.conversation.peerUser?.organization ?? 0
+            : 0,
         peerUserId: _resolvedConversationId == null
             ? widget.conversation.peerUser?.userId ?? ''
             : '',
       );
-      _merge(page.messages, notify: false);
+      if (accessEpoch != _accessEpoch ||
+          (_accessRevoked && !authoritativeRestore)) {
+        return;
+      }
+      final authoritativeConversationId = authoritativeRestore
+          ? _authoritativeConversationId(page)
+          : null;
+      final authoritativeMessages = authoritativeRestore && _isGroupConversation
+          ? page.messages
+                .where((message) {
+                  final allowed =
+                      _groupEntry?.containsMessageSequence(
+                        message.messageSeq,
+                      ) ==
+                      true;
+                  if (!allowed) {
+                    throw const FormatException('权威群历史包含访问周期外消息');
+                  }
+                  return true;
+                })
+                .toList(growable: false)
+          : page.messages;
+      if (!authoritativeRestore) _merge(authoritativeMessages, notify: false);
       if (mounted) {
         setState(() {
+          if (authoritativeRestore) {
+            _accessRevoked = false;
+            _resolvedConversationId ??= authoritativeConversationId;
+            _messages
+              ..clear()
+              ..addEntries(
+                authoritativeMessages.map(
+                  (message) => MapEntry(message.messageId, message),
+                ),
+              );
+            _deliveryStatuses.clear();
+            for (final message in authoritativeMessages) {
+              if (message.deliveryStatus case final status?) {
+                _advanceDelivery(message.messageId, status);
+              }
+            }
+          }
           _beforeSeq = page.nextBeforeSeq;
           _hasMoreBefore = page.hasMoreBefore;
         });
@@ -447,25 +1241,36 @@ final class _ConversationPageState extends State<ConversationPage> {
       await _markRead();
       _scrollToBottom();
     } on Object catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _error = error.toString());
+      }
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted && accessEpoch == _accessEpoch) {
+        _authoritativeAccessRefreshInFlight = false;
+        setState(() => _loading = false);
+      }
     }
   }
 
   Future<void> _loadOlder() async {
     if (_loadingOlder || !_hasMoreBefore || _beforeSeq <= 0) return;
+    final accessEpoch = _accessEpoch;
     setState(() => _loadingOlder = true);
     try {
       final page = await widget.messaging.fetchMessages(
         tenant: widget.tenant,
         session: widget.session,
+        conversationType: widget.conversation.conversationType,
         conversationId: _requestConversationId,
+        peerOrganization: _resolvedConversationId == null
+            ? widget.conversation.peerUser?.organization ?? 0
+            : 0,
         peerUserId: _resolvedConversationId == null
             ? widget.conversation.peerUser?.userId ?? ''
             : '',
         beforeSeq: _beforeSeq,
       );
+      if (_accessRevoked || accessEpoch != _accessEpoch) return;
       _merge(page.messages, notify: false);
       if (mounted) {
         setState(() {
@@ -474,57 +1279,75 @@ final class _ConversationPageState extends State<ConversationPage> {
         });
       }
     } on Object catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted && accessEpoch == _accessEpoch && !_accessRevoked) {
+        setState(() => _error = error.toString());
+      }
     } finally {
-      if (mounted) setState(() => _loadingOlder = false);
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _loadingOlder = false);
+      }
     }
   }
 
   Future<void> _markRead() async {
-    if (_messages.isEmpty) return;
+    if (!_canWrite || _messages.isEmpty) return;
+    final accessEpoch = _accessEpoch;
+    bool accessIsCurrent() => _canWrite && accessEpoch == _accessEpoch;
     final conversationId = _resolvedConversationId;
     if (conversationId == null || conversationId.isEmpty) return;
     try {
       final messages = _orderedMessages;
       if (widget.im.isConnected) {
         for (final message in messages) {
-          if (message.senderId == widget.session.user.userId ||
+          if (!accessIsCurrent()) return;
+          if (_isCurrentUserMessage(message) ||
               _readAcknowledged.contains(message.messageId)) {
             continue;
           }
           await widget.im.acknowledge(
-            messageId: message.messageId,
+            message: message,
             status: AppImDeliveryStatus.read,
+            identity: _securityContext(conversationId),
           );
+          if (!accessIsCurrent()) return;
           _readAcknowledged.add(message.messageId);
         }
+        if (!accessIsCurrent()) return;
         await widget.im.markConversationRead(
-          conversationId: conversationId,
-          lastReadMessageId: messages.last.messageId,
+          identity: _securityContext(conversationId),
+          lastReadMessage: messages.last,
         );
       } else {
+        if (!accessIsCurrent()) return;
         await widget.messaging.markRead(
           tenant: widget.tenant,
           session: widget.session,
+          conversationType: widget.conversation.conversationType,
           conversationId: conversationId,
         );
       }
     } on Object catch (error) {
+      if (!accessIsCurrent()) return;
       try {
+        if (!accessIsCurrent()) return;
         await widget.messaging.markRead(
           tenant: widget.tenant,
           session: widget.session,
+          conversationType: widget.conversation.conversationType,
           conversationId: conversationId,
         );
       } on Object {
-        if (mounted) setState(() => _error = error.toString());
+        if (mounted && accessIsCurrent()) {
+          setState(() => _error = error.toString());
+        }
       }
     }
   }
 
   Future<void> _send() async {
     final text = _composer.text.trim();
-    if (text.isEmpty || _sending) return;
+    if (text.isEmpty || _sending || !_canWrite) return;
+    final accessEpoch = _accessEpoch;
     setState(() {
       _sending = true;
       _error = null;
@@ -533,55 +1356,80 @@ final class _ConversationPageState extends State<ConversationPage> {
       final message = await widget.im.sendText(
         conversationType: widget.conversation.conversationType,
         conversationId: _resolvedConversationId,
+        toOrganization: widget.conversation.peerUser?.organization,
         toUserId: widget.conversation.peerUser?.userId,
         text: text,
       );
+      if (!mounted || _accessRevoked || accessEpoch != _accessEpoch) return;
       _composer.clear();
       _merge([message]);
       _scrollToBottom();
     } on Object catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted && accessEpoch == _accessEpoch && !_accessRevoked) {
+        setState(() => _error = error.toString());
+      }
     } finally {
-      if (mounted) setState(() => _sending = false);
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _sending = false);
+      }
     }
   }
 
   Future<void> _sendMedia(AppMediaKind kind) async {
-    if (_sending) return;
+    if (_sending || !_canWrite) return;
+    final accessEpoch = _accessEpoch;
     final picked = await widget.mediaPicker.pick(kind);
-    if (picked == null || !mounted) return;
+    if (picked == null ||
+        !mounted ||
+        _accessRevoked ||
+        accessEpoch != _accessEpoch) {
+      return;
+    }
     setState(() {
       _sending = true;
       _error = null;
     });
     try {
       await widget.beforeMediaUpload?.call(picked.size);
+      if (!mounted || _accessRevoked || accessEpoch != _accessEpoch) return;
       final uploaded = await widget.media.upload(
         tenant: widget.tenant,
         session: widget.session,
         kind: kind,
+        conversationType: widget.conversation.conversationType,
+        conversationId:
+            _resolvedConversationId ?? widget.conversation.conversationId,
         filePath: picked.path,
         filename: picked.filename,
         size: picked.size,
         mimeType: picked.mimeType,
       );
+      if (!mounted || _accessRevoked || accessEpoch != _accessEpoch) return;
       final message = await widget.im.sendAsset(
         conversationType: widget.conversation.conversationType,
         conversationId: _resolvedConversationId,
+        toOrganization: widget.conversation.peerUser?.organization,
         toUserId: widget.conversation.peerUser?.userId,
         messageType: kind.messageType,
         fileId: uploaded.fileId,
       );
+      if (!mounted || _accessRevoked || accessEpoch != _accessEpoch) return;
       _merge([message]);
       _scrollToBottom();
     } on Object catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted && accessEpoch == _accessEpoch && !_accessRevoked) {
+        setState(() => _error = error.toString());
+      }
     } finally {
-      if (mounted) setState(() => _sending = false);
+      if (mounted && accessEpoch == _accessEpoch) {
+        setState(() => _sending = false);
+      }
     }
   }
 
   Future<void> _showAttachmentPicker() async {
+    if (!_canWrite) return;
+    final accessEpoch = _accessEpoch;
     final kind = await showModalBottomSheet<AppMediaKind>(
       context: context,
       showDragHandle: true,
@@ -604,7 +1452,173 @@ final class _ConversationPageState extends State<ConversationPage> {
         ),
       ),
     );
-    if (kind != null && mounted) await _sendMedia(kind);
+    if (kind != null &&
+        mounted &&
+        !_accessRevoked &&
+        accessEpoch == _accessEpoch) {
+      await _sendMedia(kind);
+    }
+  }
+
+  void _onComposerChanged(String value) {
+    if (value.trim().isEmpty ||
+        _accessRevoked ||
+        !_canWrite ||
+        _connectionStatus != AppImConnectionStatus.connected) {
+      return;
+    }
+    final conversationId = _resolvedConversationId;
+    if (conversationId == null || conversationId.isEmpty) return;
+    final now = DateTime.now();
+    if (_lastTypingSentAt != null &&
+        now.difference(_lastTypingSentAt!) < const Duration(seconds: 2)) {
+      return;
+    }
+    _lastTypingSentAt = now;
+    try {
+      widget.im.sendTyping(_securityContext(conversationId));
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    }
+  }
+
+  Future<void> _sendScreenshot() async {
+    final conversationId = _resolvedConversationId;
+    if (!_canWrite || conversationId == null || conversationId.isEmpty) {
+      return;
+    }
+    final accessEpoch = _accessEpoch;
+    try {
+      final notice = await widget.im.sendScreenshot(
+        _securityContext(conversationId),
+      );
+      if (!mounted || _accessRevoked || accessEpoch != _accessEpoch) return;
+      if (notice != null) _merge([notice]);
+    } on Object catch (error) {
+      if (mounted && accessEpoch == _accessEpoch && !_accessRevoked) {
+        setState(() => _error = error.toString());
+      }
+    }
+  }
+
+  Future<void> _showMessageActions(AppImMessage message) async {
+    if (!_canWrite || message.status != 'normal') return;
+    final accessEpoch = _accessEpoch;
+    final outgoing = _isCurrentUserMessage(message);
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            if (outgoing && message.messageType == 1)
+              ListTile(
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text('编辑'),
+                onTap: () => Navigator.pop(context, 'edit'),
+              ),
+            if (outgoing)
+              ListTile(
+                leading: const Icon(Icons.undo_rounded),
+                title: const Text('撤回'),
+                onTap: () => Navigator.pop(context, 'recall'),
+              ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('仅从我的设备删除'),
+              onTap: () => Navigator.pop(context, 'delete_self'),
+            ),
+            if (outgoing)
+              ListTile(
+                leading: const Icon(Icons.delete_forever_outlined),
+                title: const Text('为双方删除'),
+                onTap: () => Navigator.pop(context, 'delete_both'),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (action == null ||
+        !mounted ||
+        _accessRevoked ||
+        accessEpoch != _accessEpoch) {
+      return;
+    }
+    bool accessIsCurrent() =>
+        mounted && !_accessRevoked && accessEpoch == _accessEpoch;
+    try {
+      switch (action) {
+        case 'edit':
+          final text = await _promptEdit(message.displayText);
+          if (text == null || !accessIsCurrent()) return;
+          final result = await widget.im.editMessage(
+            message,
+            text,
+            identity: _securityContext(_conversationId),
+          );
+          if (!accessIsCurrent()) return;
+          await _applyMutationResult(result);
+        case 'recall':
+          if (!accessIsCurrent()) return;
+          final result = await widget.im.recallMessage(
+            message,
+            identity: _securityContext(_conversationId),
+          );
+          if (!accessIsCurrent()) return;
+          await _applyMutationResult(result);
+          break;
+        case 'delete_self':
+          if (!accessIsCurrent()) return;
+          final result = await widget.im.deleteMessage(
+            message,
+            scope: 'self',
+            identity: _securityContext(_conversationId),
+          );
+          if (!accessIsCurrent()) return;
+          await _applyMutationResult(result);
+          break;
+        case 'delete_both':
+          if (!accessIsCurrent()) return;
+          final result = await widget.im.deleteMessage(
+            message,
+            scope: 'both',
+            identity: _securityContext(_conversationId),
+          );
+          if (!accessIsCurrent()) return;
+          await _applyMutationResult(result);
+          break;
+      }
+    } on Object catch (error) {
+      if (accessIsCurrent()) setState(() => _error = error.toString());
+    }
+  }
+
+  Future<String?> _promptEdit(String initialValue) async {
+    final controller = TextEditingController(text: initialValue);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('编辑消息'),
+        content: TextField(
+          key: const ValueKey('edit-message-field'),
+          controller: controller,
+          autofocus: true,
+          maxLines: 4,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    return result == null || result.isEmpty ? null : result;
   }
 
   Future<void> _reconnect() async {
@@ -615,41 +1629,503 @@ final class _ConversationPageState extends State<ConversationPage> {
     }
   }
 
-  void _merge(Iterable<AppImMessage> messages, {bool notify = true}) {
+  bool _merge(Iterable<AppImMessage> messages, {bool notify = true}) {
+    if (_accessRevoked) return false;
+    var changed = false;
     for (final message in messages) {
+      final expectedConversationId =
+          _resolvedConversationId ??
+          (widget.conversation.isVirtual
+              ? message.conversationId
+              : widget.conversation.conversationId);
+      if (!_securityContext(expectedConversationId).acceptsMessage(message)) {
+        continue;
+      }
+      if (_isGroupConversation &&
+          _groupEntry?.containsMessageSequence(message.messageSeq) != true) {
+        continue;
+      }
       if (_resolvedConversationId == null &&
           message.conversationId.isNotEmpty) {
+        widget.im.registerConversationIdentities([
+          _securityContext(message.conversationId),
+        ]);
         _resolvedConversationId = message.conversationId;
       }
       _messages[message.messageId] = message;
+      changed = true;
       if (message.deliveryStatus case final status?) {
         _advanceDelivery(message.messageId, status);
       }
     }
-    if (notify && mounted) setState(() {});
+    if (changed && notify && mounted) setState(() {});
+    return changed;
   }
 
   void _applyReceipt(AppImReceipt receipt) {
-    if (receipt.conversationId != _conversationId ||
-        receipt.senderId != widget.session.user.userId) {
+    final message = _messages[receipt.messageId];
+    if (!_canReceiveRealtime ||
+        message == null ||
+        receipt.conversationId != _conversationId ||
+        receipt.messageSeq != message.messageSeq ||
+        receipt.senderOrganization != message.senderOrganization ||
+        receipt.senderId != message.senderId) {
       return;
     }
-    _advanceDelivery(receipt.messageId, receipt.status);
-    if (mounted) setState(() {});
+    final direction = _securityContext(
+      _conversationId,
+    ).classifyReceipt(receipt);
+    switch (direction) {
+      case AppImEventDirection.peerReadsCurrent:
+        _advanceDelivery(receipt.messageId, receipt.status);
+        if (mounted) setState(() {});
+        return;
+      case AppImEventDirection.currentReadsPeer:
+        if (receipt.status == AppImDeliveryStatus.read) {
+          _localReadSequence = _localReadSequence < receipt.messageSeq
+              ? receipt.messageSeq
+              : _localReadSequence;
+          _readAcknowledged.add(receipt.messageId);
+        }
+        return;
+      case AppImEventDirection.groupMember:
+        if (appImSameIdentity(
+              receipt.userOrganization,
+              receipt.userId,
+              widget.session.organization,
+              widget.session.user.userId,
+            ) &&
+            receipt.status == AppImDeliveryStatus.read) {
+          _localReadSequence = _localReadSequence < receipt.messageSeq
+              ? receipt.messageSeq
+              : _localReadSequence;
+          _readAcknowledged.add(receipt.messageId);
+        }
+        return;
+      case AppImEventDirection.invalid:
+        return;
+    }
   }
 
   void _applyConversationRead(AppImConversationReadState read) {
-    if (read.conversationId != _conversationId ||
-        read.userId == widget.session.user.userId) {
+    final lastReadMessage = _messages[read.lastReadMessageId];
+    if (!_canReceiveRealtime ||
+        read.conversationId != _conversationId ||
+        (lastReadMessage != null &&
+            read.lastReadSeq != lastReadMessage.messageSeq)) {
       return;
     }
-    for (final message in _messages.values) {
-      if (message.senderId == widget.session.user.userId &&
-          message.messageSeq <= read.lastReadSeq) {
-        _advanceDelivery(message.messageId, AppImDeliveryStatus.read);
+    final direction = _securityContext(
+      _conversationId,
+    ).classifyConversationRead(read);
+    if (direction == AppImEventDirection.invalid) return;
+    if (direction == AppImEventDirection.peerReadsCurrent) {
+      for (final message in _messages.values) {
+        if (_isCurrentUserMessage(message) &&
+            message.messageSeq <= read.lastReadSeq) {
+          _advanceDelivery(message.messageId, AppImDeliveryStatus.read);
+        }
+      }
+      if (mounted) setState(() {});
+      return;
+    }
+    if (direction == AppImEventDirection.currentReadsPeer ||
+        (direction == AppImEventDirection.groupMember &&
+            appImSameIdentity(
+              read.userOrganization,
+              read.userId,
+              widget.session.organization,
+              widget.session.user.userId,
+            ))) {
+      _localReadSequence = _localReadSequence < read.lastReadSeq
+          ? read.lastReadSeq
+          : _localReadSequence;
+      for (final message in _messages.values) {
+        if (!_isCurrentUserMessage(message) &&
+            message.messageSeq <= read.lastReadSeq) {
+          _readAcknowledged.add(message.messageId);
+        }
       }
     }
+  }
+
+  Future<void> _applyMutation(AppImMessageMutation mutation) async {
+    if (!_canReceiveRealtime || mutation.conversationId != _conversationId) {
+      return;
+    }
+    final security = _securityContext(_conversationId);
+    if (!security.isParticipant(
+      mutation.actorOrganization,
+      mutation.actorUserId,
+    )) {
+      return;
+    }
+    final original = _messages[mutation.messageId];
+    if (original == null) {
+      await _refreshAuthoritativeHistory();
+      return;
+    }
+    if (!security.acceptsMutation(mutation, original)) {
+      return;
+    }
+    final sequenceDecision = classifyAppImChangeSequence(
+      lastConversationSequence: _lastConversationChangeSequence,
+      lastMessageSequence: _lastMessageChangeSequences[mutation.messageId] ?? 0,
+      incomingSequence: mutation.changeSeq,
+    );
+    if (sequenceDecision == AppImChangeSequenceDecision.invalid ||
+        sequenceDecision == AppImChangeSequenceDecision.stale) {
+      return;
+    }
+    if (sequenceDecision == AppImChangeSequenceDecision.gap) {
+      await _refreshAuthoritativeHistory();
+      return;
+    }
+    if (mutation.eventType == 'message.deleted_self') {
+      _messages.remove(mutation.messageId);
+      _deliveryStatuses.remove(mutation.messageId);
+    } else if (mutation.eventType == 'message.edited') {
+      final edited = mutation.message;
+      if (edited == null) return;
+      _messages[mutation.messageId] = edited;
+    } else if (mutation.eventType == 'message.recalled') {
+      _messages[mutation.messageId] = original.copyWith(
+        content: null,
+        status: 'recalled',
+      );
+    } else if (mutation.eventType == 'message.deleted_both') {
+      _messages[mutation.messageId] = original.copyWith(
+        content: null,
+        status: 'deleted_both',
+      );
+    } else {
+      return;
+    }
+    _lastConversationChangeSequence = mutation.changeSeq;
+    _lastMessageChangeSequences[mutation.messageId] = mutation.changeSeq;
     if (mounted) setState(() {});
+  }
+
+  Future<void> _applyMutationResult(AppImMutationResult result) async {
+    if (_accessRevoked ||
+        result.conversationId != _conversationId ||
+        result.messageSeq <= 0) {
+      return;
+    }
+    final original = _messages[result.messageId];
+    if (original == null ||
+        original.conversationId != result.conversationId ||
+        original.messageSeq != result.messageSeq) {
+      await _refreshAuthoritativeHistory();
+      return;
+    }
+    final decision = classifyAppImChangeSequence(
+      lastConversationSequence: _lastConversationChangeSequence,
+      lastMessageSequence: _lastMessageChangeSequences[result.messageId] ?? 0,
+      incomingSequence: result.changeSeq,
+    );
+    if (decision == AppImChangeSequenceDecision.invalid ||
+        decision == AppImChangeSequenceDecision.stale) {
+      return;
+    }
+    if (decision == AppImChangeSequenceDecision.gap) {
+      await _refreshAuthoritativeHistory();
+      return;
+    }
+    switch (result.command) {
+      case 'edit':
+        final edited = result.message;
+        if (edited == null ||
+            !_securityContext(_conversationId).acceptsMessage(edited) ||
+            !appImSameIdentity(
+              edited.senderOrganization,
+              edited.senderId,
+              original.senderOrganization,
+              original.senderId,
+            )) {
+          return;
+        }
+        _messages[result.messageId] = edited;
+      case 'recall':
+        if (result.status != 'recalled') return;
+        _messages[result.messageId] = original.copyWith(
+          content: null,
+          status: 'recalled',
+        );
+      case 'delete':
+        if (result.scope == 'self') {
+          _messages.remove(result.messageId);
+          _deliveryStatuses.remove(result.messageId);
+        } else if (result.scope == 'both' && result.status == 'deleted_both') {
+          _messages[result.messageId] = original.copyWith(
+            content: null,
+            status: 'deleted_both',
+          );
+        } else {
+          return;
+        }
+      default:
+        return;
+    }
+    _lastConversationChangeSequence = result.changeSeq;
+    _lastMessageChangeSequences[result.messageId] = result.changeSeq;
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _refreshAuthoritativeHistory() async {
+    final conversationId = _resolvedConversationId;
+    if (_accessRevoked ||
+        conversationId == null ||
+        conversationId.isEmpty ||
+        !widget.im.isConnected) {
+      return;
+    }
+    final accessEpoch = _accessEpoch;
+    try {
+      for (var attempt = 0; attempt < 5; attempt++) {
+        var afterMessageSeq = 0;
+        var afterChangeSeq = _lastConversationChangeSequence;
+        String? batchSnapshotId;
+        var restart = false;
+        var completed = false;
+        final nextMessages = <String, AppImMessage>{};
+        final changes = <AppImSyncedMessageChange>[];
+        for (var pageNumber = 0; pageNumber < 100; pageNumber++) {
+          final page = await widget.im.syncConversation(
+            identity: _securityContext(conversationId),
+            afterMessageSeq: afterMessageSeq,
+            afterChangeSeq: afterChangeSeq,
+          );
+          if (!mounted || _accessRevoked || accessEpoch != _accessEpoch) {
+            return;
+          }
+          batchSnapshotId ??= page.crossOrgAccessSnapshotId;
+          if (page.crossOrgAccessSnapshotId != batchSnapshotId) {
+            restart = true;
+            break;
+          }
+          for (final message in page.messages) {
+            if (!_securityContext(conversationId).acceptsMessage(message)) {
+              throw const FormatException('会话 SYNC 包含非权威复合身份消息');
+            }
+            nextMessages[message.messageId] = message;
+          }
+          changes.addAll(page.changes);
+          afterMessageSeq = page.nextAfterMessageSeq;
+          afterChangeSeq = page.nextAfterChangeSeq;
+          if (!page.messagesHasMore && !page.changesHasMore) {
+            completed = true;
+            break;
+          }
+        }
+        if (restart) continue;
+        if (!completed || batchSnapshotId == null) {
+          throw const AppImConnectionException('会话 SYNC 分页超过安全上限');
+        }
+        if (_isCrossOrganizationConversation) {
+          if (batchSnapshotId == '0') {
+            _failCloseCrossOrganization();
+            return;
+          }
+          final observation = _accessGate.snapshots.observe(batchSnapshotId);
+          if (observation == AppImAccessSnapshotObservation.invalid) {
+            throw const AppImConnectionException(
+              '会话 SYNC 访问快照无效',
+              code: 'IM_ACCESS_SNAPSHOT_INVALID',
+            );
+          }
+          if (observation == AppImAccessSnapshotObservation.stale) {
+            continue;
+          }
+        }
+        changes.sort(
+          (left, right) => left.changeSeq.compareTo(right.changeSeq),
+        );
+        final nextMessageChanges = <String, int>{};
+        for (final change in changes) {
+          _applySyncedChange(
+            nextMessages,
+            nextMessageChanges,
+            change,
+            _securityContext(conversationId),
+          );
+        }
+        if (!mounted || _accessRevoked || accessEpoch != _accessEpoch) {
+          return;
+        }
+        setState(() {
+          _messages
+            ..clear()
+            ..addAll(nextMessages);
+          _deliveryStatuses.removeWhere(
+            (messageId, _) => !nextMessages.containsKey(messageId),
+          );
+          for (final message in nextMessages.values) {
+            if (message.deliveryStatus case final status?) {
+              _advanceDelivery(message.messageId, status);
+            }
+          }
+          _lastMessageChangeSequences
+            ..clear()
+            ..addAll(nextMessageChanges);
+          _lastConversationChangeSequence = afterChangeSeq;
+          _beforeSeq = nextMessages.values.isEmpty
+              ? 0
+              : nextMessages.values
+                    .map((message) => message.messageSeq)
+                    .reduce((left, right) => left < right ? left : right);
+          _hasMoreBefore = false;
+          _error = null;
+        });
+        return;
+      }
+      throw const AppImConnectionException(
+        '会话 SYNC 访问快照持续变化或早于本地高水位',
+        code: 'IM_ACCESS_SNAPSHOT_UNSTABLE',
+      );
+    } on Object catch (error) {
+      if (!mounted || _accessRevoked || accessEpoch != _accessEpoch) return;
+      if (isAppImAccessSnapshotFailure(error) &&
+          _isCrossOrganizationConversation) {
+        _failCloseCrossOrganization(error: error);
+      } else {
+        if (mounted) setState(() => _error = error.toString());
+      }
+    }
+  }
+
+  void _applySyncedChange(
+    Map<String, AppImMessage> messages,
+    Map<String, int> messageSequences,
+    AppImSyncedMessageChange change,
+    AppImConversationIdentityContext identity,
+  ) {
+    final previousSequence = messageSequences[change.messageId] ?? 0;
+    if (change.changeSeq <= previousSequence) return;
+    final original = messages[change.messageId];
+    if (!identity.acceptsSyncedChange(change, original)) {
+      throw const FormatException('会话 SYNC 变更复合身份无效');
+    }
+    switch (change.changeType) {
+      case 'delete_self':
+        messages.remove(change.messageId);
+      case 'delete_both':
+        if (original != null) {
+          messages[change.messageId] = original.copyWith(
+            content: null,
+            status: 'deleted_both',
+          );
+        }
+      case 'recall':
+        if (original != null) {
+          messages[change.messageId] = original.copyWith(
+            content: null,
+            status: 'recalled',
+          );
+        }
+      case 'edit':
+        if (original != null) {
+          messages[change.messageId] = original.copyWith(
+            content: Map<String, Object?>.from(
+              change.payload['content']! as Map,
+            ),
+            editTime: change.payload['edit_time']! as String,
+            editCount: change.payload['edit_count']! as int,
+            updateTime: change.createTime,
+          );
+        }
+      default:
+        throw const FormatException('会话 SYNC 变更类型无效');
+    }
+    messageSequences[change.messageId] = change.changeSeq;
+  }
+
+  void _applyAccessChanged(AppImConversationAccessChanged accessChanged) {
+    final peer = widget.conversation.peerUser;
+    if (!appImSameIdentity(
+          accessChanged.targetOrganization,
+          accessChanged.targetUserId,
+          widget.session.organization,
+          widget.session.user.userId,
+        ) ||
+        peer == null ||
+        !appImSameIdentity(
+          accessChanged.peerOrganization,
+          accessChanged.peerUserId,
+          peer.organization,
+          peer.userId,
+        ) ||
+        (!widget.conversation.isVirtual &&
+            accessChanged.conversationId != _conversationId) ||
+        _accessGate.observe(accessChanged) != AppImAccessEventDecision.apply) {
+      return;
+    }
+    if (accessChanged.allowed) {
+      _prepareAuthoritativeAccessRefresh();
+      _requestAuthoritativeAccessRefresh();
+      return;
+    }
+    _failCloseCrossOrganization(message: '跨机构会话访问已撤销', resetSnapshot: false);
+  }
+
+  void _failCloseCrossOrganization({
+    Object? error,
+    String message = '跨机构访问暂不可用',
+    bool resetSnapshot = true,
+  }) {
+    if (resetSnapshot) _accessGate.resetSnapshot('0');
+    _accessEpoch += 1;
+    _accessDeniedByEvent = true;
+    _authoritativeAccessRefreshInFlight = false;
+    _typingExpiry?.cancel();
+    _composer.clear();
+    if (mounted) {
+      setState(() {
+        _accessRevoked = true;
+        _messages.clear();
+        _deliveryStatuses.clear();
+        _readAcknowledged.clear();
+        _lastMessageChangeSequences.clear();
+        _lastConversationChangeSequence = 0;
+        _typingLabel = null;
+        _sending = false;
+        _loading = false;
+        _loadingOlder = false;
+        _error = error?.toString() ?? message;
+      });
+    }
+  }
+
+  void _applyTyping(AppImTypingState typing) {
+    if (_connectionStatus != AppImConnectionStatus.connected ||
+        !_canWrite ||
+        typing.conversationId != _conversationId ||
+        (typing.actorOrganization == widget.session.organization &&
+            typing.actorUserId == widget.session.user.userId)) {
+      return;
+    }
+    final peer = widget.conversation.peerUser;
+    if (widget.conversation.conversationType == 1 &&
+        (peer == null ||
+            typing.actorOrganization != peer.organization ||
+            typing.actorUserId != peer.userId)) {
+      return;
+    }
+    if (widget.conversation.conversationType == 2 &&
+        typing.actorOrganization != widget.session.organization) {
+      return;
+    }
+    _typingExpiry?.cancel();
+    if (mounted) {
+      setState(() {
+        _typingLabel = typing.username.isEmpty
+            ? '对方正在输入…'
+            : '${typing.username} 正在输入…';
+      });
+    }
+    _typingExpiry = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _typingLabel = null);
+    });
   }
 
   void _advanceDelivery(String messageId, AppImDeliveryStatus next) {
@@ -674,7 +2150,23 @@ final class _ConversationPageState extends State<ConversationPage> {
   Widget build(BuildContext context) {
     final messages = _orderedMessages;
     return Scaffold(
-      appBar: AppBar(title: Text(widget.conversation.title)),
+      appBar: AppBar(
+        title: Text(widget.conversation.title),
+        actions: [
+          IconButton(
+            key: const ValueKey('send-screenshot-notice'),
+            onPressed:
+                _resolvedConversationId == null ||
+                    _accessRevoked ||
+                    !_canWrite ||
+                    _connectionStatus != AppImConnectionStatus.connected
+                ? null
+                : _sendScreenshot,
+            icon: const Icon(Icons.screenshot_monitor_outlined),
+            tooltip: '发送截屏提示',
+          ),
+        ],
+      ),
       body: SafeArea(
         child: Column(
           children: [
@@ -687,10 +2179,20 @@ final class _ConversationPageState extends State<ConversationPage> {
               MaterialBanner(
                 content: Text(error),
                 actions: [
-                  TextButton(
-                    onPressed: () => setState(() => _error = null),
-                    child: const Text('关闭'),
-                  ),
+                  if (_accessRevoked)
+                    TextButton(
+                      onPressed:
+                          _accessDeniedByEvent ||
+                              _accessGate.isCrossOrganizationFailClosed
+                          ? null
+                          : _requestAuthoritativeAccessRefresh,
+                      child: const Text('重试'),
+                    )
+                  else
+                    TextButton(
+                      onPressed: () => setState(() => _error = null),
+                      child: const Text('关闭'),
+                    ),
                 ],
               ),
             Expanded(
@@ -716,17 +2218,29 @@ final class _ConversationPageState extends State<ConversationPage> {
                         return _MessageBubble(
                           key: ValueKey('message-${message.messageId}'),
                           message: message,
-                          outgoing:
-                              message.senderId == widget.session.user.userId,
+                          outgoing: _isCurrentUserMessage(message),
                           deliveryStatus: _deliveryStatuses[message.messageId],
                           tenant: widget.tenant,
                           session: widget.session,
                           media: widget.media,
+                          onLongPress: () => _showMessageActions(message),
                         );
                       },
                     ),
             ),
             const Divider(height: 1),
+            if (_typingLabel case final label?)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    label,
+                    key: const ValueKey('typing-indicator'),
+                    style: Theme.of(context).textTheme.labelMedium,
+                  ),
+                ),
+              ),
             Container(
               color: Colors.white,
               padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
@@ -736,6 +2250,8 @@ final class _ConversationPageState extends State<ConversationPage> {
                     key: const ValueKey('attach-media'),
                     onPressed:
                         _sending ||
+                            _accessRevoked ||
+                            !_canWrite ||
                             _connectionStatus != AppImConnectionStatus.connected
                         ? null
                         : _showAttachmentPicker,
@@ -747,6 +2263,8 @@ final class _ConversationPageState extends State<ConversationPage> {
                     child: TextField(
                       key: const ValueKey('message-composer'),
                       controller: _composer,
+                      enabled: _canWrite,
+                      onChanged: _onComposerChanged,
                       minLines: 1,
                       maxLines: 4,
                       textInputAction: TextInputAction.newline,
@@ -761,6 +2279,8 @@ final class _ConversationPageState extends State<ConversationPage> {
                     key: const ValueKey('send-message'),
                     onPressed:
                         _sending ||
+                            _accessRevoked ||
+                            !_canWrite ||
                             _connectionStatus != AppImConnectionStatus.connected
                         ? null
                         : _send,
@@ -782,6 +2302,23 @@ final class _ConversationPageState extends State<ConversationPage> {
   }
 }
 
+bool _groupAccessEntryShrank(
+  GroupMemberAccessEntry? previous,
+  GroupMemberAccessEntry next,
+) {
+  if (previous == null) return false;
+  if (previous.isActive && !next.isActive) return true;
+  for (final oldPeriod in previous.periods) {
+    final retained = next.periods.any(
+      (newPeriod) =>
+          newPeriod.periodNo == oldPeriod.periodNo &&
+          newPeriod.containsPeriod(oldPeriod),
+    );
+    if (!retained) return true;
+  }
+  return false;
+}
+
 final class _MessageBubble extends StatelessWidget {
   const _MessageBubble({
     super.key,
@@ -791,6 +2328,7 @@ final class _MessageBubble extends StatelessWidget {
     required this.tenant,
     required this.session,
     required this.media,
+    required this.onLongPress,
   });
 
   final AppImMessage message;
@@ -799,6 +2337,7 @@ final class _MessageBubble extends StatelessWidget {
   final TenantConfig tenant;
   final AppSession session;
   final AppMediaGateway media;
+  final VoidCallback onLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -806,58 +2345,61 @@ final class _MessageBubble extends StatelessWidget {
     final detail = outgoing ? Colors.white70 : B8Colors.muted;
     return Align(
       alignment: outgoing ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        constraints: const BoxConstraints(maxWidth: 320),
-        margin: const EdgeInsets.symmetric(vertical: 5),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: outgoing ? B8Colors.primary : Colors.white,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(18),
-            topRight: const Radius.circular(18),
-            bottomLeft: Radius.circular(outgoing ? 18 : 5),
-            bottomRight: Radius.circular(outgoing ? 5 : 18),
+      child: GestureDetector(
+        onLongPress: onLongPress,
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 320),
+          margin: const EdgeInsets.symmetric(vertical: 5),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: outgoing ? B8Colors.primary : Colors.white,
+            borderRadius: BorderRadius.only(
+              topLeft: const Radius.circular(18),
+              topRight: const Radius.circular(18),
+              bottomLeft: Radius.circular(outgoing ? 18 : 5),
+              bottomRight: Radius.circular(outgoing ? 5 : 18),
+            ),
           ),
-        ),
-        child: IconTheme(
-          data: IconThemeData(color: foreground),
-          child: DefaultTextStyle.merge(
-            style: TextStyle(color: foreground),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                if (!outgoing && message.senderUser != null)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 3),
-                    child: Text(
-                      message.senderUser!.displayName,
-                      style: TextStyle(color: detail, fontSize: 11),
+          child: IconTheme(
+            data: IconThemeData(color: foreground),
+            child: DefaultTextStyle.merge(
+              style: TextStyle(color: foreground),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (!outgoing && message.senderUser != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 3),
+                      child: Text(
+                        message.senderUser!.displayName,
+                        style: TextStyle(color: detail, fontSize: 11),
+                      ),
                     ),
-                  ),
-                if (message.messageType == 2 || message.messageType == 3)
-                  _AssetMessageContent(
-                    message: message,
-                    tenant: tenant,
-                    session: session,
-                    media: media,
-                  )
-                else
+                  if (message.messageType == 2 || message.messageType == 3)
+                    _AssetMessageContent(
+                      message: message,
+                      tenant: tenant,
+                      session: session,
+                      media: media,
+                    )
+                  else
+                    Text(
+                      message.displayText,
+                      style: TextStyle(color: foreground),
+                    ),
+                  const SizedBox(height: 3),
                   Text(
-                    message.displayText,
-                    style: TextStyle(color: foreground),
-                  ),
-                const SizedBox(height: 3),
-                Text(
-                  _shortTime(message.createTime),
-                  style: TextStyle(color: detail, fontSize: 11),
-                ),
-                if (outgoing && deliveryStatus != null)
-                  Text(
-                    deliveryStatus!.label,
-                    key: ValueKey('delivery-${message.messageId}'),
+                    _shortTime(message.createTime),
                     style: TextStyle(color: detail, fontSize: 11),
                   ),
-              ],
+                  if (outgoing && deliveryStatus != null)
+                    Text(
+                      deliveryStatus!.label,
+                      key: ValueKey('delivery-${message.messageId}'),
+                      style: TextStyle(color: detail, fontSize: 11),
+                    ),
+                ],
+              ),
             ),
           ),
         ),
@@ -897,8 +2439,10 @@ final class _AssetMessageContentState extends State<_AssetMessageContent> {
     tenant: widget.tenant,
     session: widget.session,
     fileId: widget.message.assetFileId,
+    conversationType: widget.message.conversationType,
     conversationId: widget.message.conversationId,
     messageId: widget.message.messageId,
+    messageSeq: widget.message.messageSeq,
   );
 
   Future<void> _download() async {
@@ -909,8 +2453,10 @@ final class _AssetMessageContentState extends State<_AssetMessageContent> {
         tenant: widget.tenant,
         session: widget.session,
         fileId: widget.message.assetFileId,
+        conversationType: widget.message.conversationType,
         conversationId: widget.message.conversationId,
         messageId: widget.message.messageId,
+        messageSeq: widget.message.messageSeq,
         filename: widget.message.assetName,
       );
       if (mounted) {

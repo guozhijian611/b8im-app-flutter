@@ -12,11 +12,16 @@ enum AppApiMethod { get, post }
 final class AppApiClient {
   AppApiClient({
     http.Client? httpClient,
+    http.Client Function()? requestClientFactory,
     this.timeout = const Duration(seconds: 15),
-  }) : _httpClient = httpClient ?? http.Client();
+  }) : _httpClient = httpClient ?? http.Client(),
+       _requestClientFactory = requestClientFactory ?? http.Client.new;
 
   final http.Client _httpClient;
+  final http.Client Function() _requestClientFactory;
   final Duration timeout;
+
+  http.Client createRequestClient() => _requestClientFactory();
 
   Future<Object?> request(
     TenantConfig tenant,
@@ -25,6 +30,7 @@ final class AppApiClient {
     String? accessToken,
     Map<String, Object?>? body,
     Map<String, String>? query,
+    http.Client? requestClient,
   }) async {
     if (!path.startsWith('/') || path.startsWith('//')) {
       throw const FormatException('API 路径必须是站内绝对路径');
@@ -41,12 +47,13 @@ final class AppApiClient {
     });
 
     late http.Response response;
+    final client = requestClient ?? _httpClient;
     try {
       response = switch (method) {
         AppApiMethod.get =>
-          await _httpClient.get(uri, headers: headers).timeout(timeout),
+          await client.get(uri, headers: headers).timeout(timeout),
         AppApiMethod.post =>
-          await _httpClient
+          await client
               .post(
                 uri,
                 headers: headers,
@@ -71,6 +78,7 @@ final class AppApiClient {
     String fileField = 'file',
     Map<String, String> fields = const {},
     Duration? requestTimeout,
+    http.Client? requestClient,
   }) async {
     if (!path.startsWith('/') || path.startsWith('//')) {
       throw const FormatException('API 路径必须是站内绝对路径');
@@ -97,7 +105,7 @@ final class AppApiClient {
     late http.Response response;
     try {
       final effectiveTimeout = requestTimeout ?? timeout;
-      final streamed = await _httpClient
+      final streamed = await (requestClient ?? _httpClient)
           .send(request)
           .timeout(effectiveTimeout);
       response = await http.Response.fromStream(
